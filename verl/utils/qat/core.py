@@ -20,7 +20,9 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+import torch
 import torch.nn as nn
+import torch.distributed as dist
 
 from verl.base_config import BaseConfig
 
@@ -37,6 +39,21 @@ class QATConfig(BaseConfig):
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
     quantization_config_path: Optional[str] = None
+    # Update-Aware Quantization (UAQ) from QuRL paper (QURL.2602.13953)
+    # Invariant scaling s > 1 reduces quantization error and amplifies weight updates (s^2 improvement).
+    # Default 1.0 disables UAQ; use 1.5 for INT8/FP8 per paper ablation.
+    uaq_scale: float = 1.0
+
+
+def _is_global_rank_zero() -> bool:
+    """Best-effort check for global rank 0; fall back to True if unavailable."""
+    try:
+        if not dist.is_available() or not dist.is_initialized():
+            return True
+        return dist.get_rank() == 0
+    except Exception:
+        # In case distributed is misconfigured, avoid crashing on logging.
+        return True
 
 
 def load_quantization_config(qat_config: QATConfig) -> dict[str, Any]:
@@ -57,6 +74,115 @@ def load_quantization_config(qat_config: QATConfig) -> dict[str, Any]:
 
     logger.info("Successfully loaded QAT quantization config")
     return quant_config
+
+
+def apply_update_aware_quantization(
+    model: nn.Module,
+    scale: float = 1.5,
+) -> nn.Module:
+    """Apply Update-Aware Quantization (UAQ) via invariant scaling.
+
+    From QURL paper (QURL.2602.13953): Uses invariant scaling WX = (W/s)·(sX) to simultaneously
+    reduce quantization error and amplify weight updates. The scale s is applied column-wise to
+    linear weights and absorbed into the preceding LayerNorm, preserving output.
+
+    This is a one-time weight adjustment before QAT/RL training. Empirical s=1.5 works well for
+    INT8/FP8 per paper ablation.
+
+    Args:
+        model: The model to apply UAQ to (e.g. LlamaForCausalLM, Qwen2ForCausalLM).
+        scale: Scaling factor s > 1. Use 1.0 to disable (no-op).
+
+    Returns:
+        The same model with weights modified in-place.
+    """
+    if scale <= 1.0:
+        # UAQ disabled via scale; keep this quiet to avoid log spam.
+        return model
+
+    # Resolve inner model (PEFT wraps in base_model); name_to_module uses names relative to inner
+    inner = getattr(model, "base_model", model)
+    if hasattr(inner, "model"):
+        inner = inner.model
+
+    # Build layer name -> module map (names are relative to inner, e.g. "layers.0.input_layernorm")
+    name_to_module: dict[str, nn.Module] = {}
+    for name, module in inner.named_modules():
+        name_to_module[name] = module
+
+    def get_layer_idx(name: str) -> Optional[int]:
+        m = re.search(r"layers\.(\d+)", name)
+        return int(m.group(1)) if m else None
+
+    layers_indices: set[int] = set()
+    for name in name_to_module:
+        idx = get_layer_idx(name)
+        if idx is not None:
+            layers_indices.add(idx)
+
+    if not layers_indices:
+        logger.warning("[UAQ] No decoder layers found, skipping Update-Aware Quantization")
+        return model
+
+    uaq_count = 0
+    for layer_idx in sorted(layers_indices):
+        base = f"layers.{layer_idx}."
+
+        def find_module(suffix: str) -> Optional[nn.Module]:
+            key = base + suffix
+            return name_to_module.get(key)
+
+        def find_param(module: nn.Module, attr: str = "weight") -> Optional[torch.Tensor]:
+            t = getattr(module, attr, None)
+            if t is not None and isinstance(t, torch.Tensor):
+                return t
+            return None
+
+        # QKV group: input_layernorm -> q_proj, k_proj, v_proj
+        input_ln = find_module("input_layernorm")
+        q_proj = find_module("self_attn.q_proj")
+        k_proj = find_module("self_attn.k_proj")
+        v_proj = find_module("self_attn.v_proj")
+
+        if input_ln is not None and q_proj is not None and k_proj is not None and v_proj is not None:
+            ln_w = find_param(input_ln)
+            q_w = find_param(q_proj)
+            k_w = find_param(k_proj)
+            v_w = find_param(v_proj)
+            if ln_w is not None and q_w is not None and k_w is not None and v_w is not None:
+                with torch.no_grad():
+                    q_w.div_(scale)
+                    k_w.div_(scale)
+                    v_w.div_(scale)
+                    ln_w.mul_(scale)
+                uaq_count += 1
+
+        # GateUp group: post_attention_layernorm -> gate_proj, up_proj
+        post_ln = find_module("post_attention_layernorm")
+        gate_proj = find_module("mlp.gate_proj")
+        up_proj = find_module("mlp.up_proj")
+
+        if post_ln is not None and gate_proj is not None and up_proj is not None:
+            ln_w = find_param(post_ln)
+            g_w = find_param(gate_proj)
+            u_w = find_param(up_proj)
+            if ln_w is not None and g_w is not None and u_w is not None:
+                with torch.no_grad():
+                    g_w.div_(scale)
+                    u_w.div_(scale)
+                    ln_w.mul_(scale)
+                uaq_count += 1
+
+    if uaq_count > 0:
+        msg = f"[UAQ] Applied Update-Aware Quantization with scale={scale} to {uaq_count} layer groups"
+        # Use WARNING level so it survives VERL_LOGGING_LEVEL=WARNING, and also print with banners.
+        logger.warning(msg)
+        if _is_global_rank_zero():
+            banner = "=" * 80
+            print(banner)
+            print(f"[UAQ][APPLIED] {msg}")
+            print(banner)
+    return model
 
 
 def _should_quantize(name: str, module: nn.Module, config: QATConfig) -> bool:
@@ -97,6 +223,29 @@ def apply_qat(
     if not config.enable:
         logger.info("QAT is disabled, returning original model")
         return model
+
+    # Update-Aware Quantization: one-time invariant scaling before QAT (QuRL paper).
+    # For safety and backwards-compatibility we *only* apply UAQ in W4A4 mode.
+    # W4A16 baselines stay bit‑for‑bit identical to upstream even if uaq_scale>1 is
+    # accidentally set in configs.
+    if config.mode == "w4a4" and config.uaq_scale > 1.0:
+        logger.warning(
+            f"[QAT][UAQ] Enabling Update-Aware Quantization: mode={config.mode}, "
+            f"group_size={config.group_size}, uaq_scale={config.uaq_scale}"
+        )
+        if _is_global_rank_zero():
+            print(
+                f"[QAT][UAQ] >>> UAQ ENABLED: mode={config.mode}, "
+                f"group_size={config.group_size}, scale={config.uaq_scale}"
+            )
+        apply_update_aware_quantization(model, scale=config.uaq_scale)
+    elif config.mode != "w4a4" and config.uaq_scale > 1.0:
+        # Log once per rank when UAQ is requested for non‑W4A4 modes but skipped.
+        logger.warning(
+            f"[QAT][UAQ] uaq_scale={config.uaq_scale} requested for mode={config.mode}, "
+            "but UAQ is currently only enabled for mode='w4a4'. Skipping UAQ to keep "
+            "non‑w4a4 baselines (e.g. w4a16) numerically consistent with upstream."
+        )
 
     mode = QATMode(config.mode.lower())
     logger.info(f"Applying QAT with mode={mode.value}, group_size={config.group_size}")

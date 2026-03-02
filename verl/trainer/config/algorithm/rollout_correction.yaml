@@ -24,3 +24,7 @@ loss_type: ppo_clip
 
 # Batch normalize IS weights: false = raw weights, true = normalize to mean=1.0
 rollout_is_batch_normalize: false
+
+# Adaptive Clipping Range (ACR, QuRL paper): when true and rollout_is set,
+# use per-token adaptive upper clip bound (1+ε)/r_i,t to mitigate long-horizon collapse (QAT/quantized rollout).
+rollout_acr_enabled: false

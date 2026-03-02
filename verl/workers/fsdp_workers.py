@@ -324,6 +324,45 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         if self.rank == 0:
             logger.info(f"[W4A4] Loaded {loaded_count} input scales from checkpoint")
+        self._w4a4_scales_restored = loaded_count > 0
+
+    def _calibrate_w4a4_input_scales(self):
+        """Run a forward pass to initialize input_global_scale for W4A4 when not loaded from checkpoint."""
+        if not self._qat_enabled or self.qat_config.mode != "w4a4":
+            return
+        if getattr(self, "_w4a4_scales_restored", False) or getattr(self, "_w4a4_calibrated", False):
+            return
+
+        config = self.actor_model_config
+        vocab_size = getattr(config, "vocab_size", None) or getattr(
+            getattr(config, "text_config", None), "vocab_size", 32000
+        )
+        device = torch.device(get_device_id())
+        # Use small batch/seq for calibration; token 1 to avoid padding
+        batch_size, seq_len = 2, 8
+        dummy_input_ids = torch.full(
+            (batch_size, seq_len), 1, dtype=torch.long, device=device
+        )
+        attention_mask = torch.ones_like(dummy_input_ids, device=device)
+
+        self.actor_module_fsdp.train()
+        with torch.no_grad():
+            try:
+                _ = self.actor_module_fsdp(
+                    input_ids=dummy_input_ids,
+                    attention_mask=attention_mask,
+                )
+            except Exception as e:
+                if self.rank == 0:
+                    logger.warning(
+                        f"[W4A4] Calibration forward failed (VL/special model?): {e}. "
+                        "Ensure checkpoint has input_global_scale or use W4A16."
+                    )
+                raise
+
+        self._w4a4_calibrated = True
+        if self.rank == 0:
+            logger.info("[W4A4] Calibration forward completed, input_global_scale initialized")
 
     def _build_model_optimizer(
         self,
@@ -745,6 +784,9 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
         log_gpu_memory_usage("After load_fsdp_model_to_gpu", logger=logger)
+
+        # W4A4: calibrate input_global_scale before first weight sync if not loaded from checkpoint
+        self._calibrate_w4a4_input_scales()
 
         peft_config = None
         peft_model = getattr(self.actor_module_fsdp, "_fsdp_wrapped_module", self.actor_module_fsdp)

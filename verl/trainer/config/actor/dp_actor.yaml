@@ -80,3 +80,8 @@ qat:
 
   # Path to vLLM quantization config JSON file
   quantization_config_path: null
+
+  # Update-Aware Quantization (UAQ) scale from QuRL paper (QURL.2602.13953).
+  # Invariant scaling s > 1 reduces quantization error and amplifies weight updates.
+  # Use 1.5 for INT8/FP8 per paper ablation; 1.0 disables UAQ (default).
+  uaq_scale: 1.0

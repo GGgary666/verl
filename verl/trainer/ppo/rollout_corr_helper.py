@@ -60,6 +60,7 @@ tracking metrics to diagnose and correct off-policy issues.
 - Off-policy RL (theoretical basis for IS): https://fengyao.notion.site/off-policy-rl
 """
 
+import logging
 import math
 from typing import Any, Optional
 
@@ -69,6 +70,8 @@ import verl.utils.torch_functional as verl_F
 from verl.protocol import DataProto
 from verl.trainer.config.algorithm import RolloutCorrectionConfig
 from verl.workers.config.actor import PolicyLossConfig
+
+logger = logging.getLogger(__name__)
 
 # Safety bound to prevent numerical overflow/underflow when exponentiating
 # exp(20) ≈ 485 million (upper limit for stable weights), exp(-20) ≈ 2e-9 (lower limit)
@@ -720,6 +723,7 @@ def compute_rollout_correction_and_rejection_mask(
     rollout_is: Optional[str] = None,
     rollout_is_threshold: Optional[float] = 2.0,
     rollout_is_batch_normalize: bool = False,
+    rollout_acr_enabled: bool = False,
     rollout_rs: Optional[str] = None,
     rollout_rs_threshold: Optional[str | float] = None,
 ) -> tuple[Optional[DataProto], torch.Tensor, dict[str, float]]:
@@ -781,6 +785,7 @@ def compute_rollout_correction_and_rejection_mask(
 
     # Step 2: Compute IS weights (if enabled)
     rollout_is_weights: Optional[torch.Tensor] = None
+    rollout_acr_r: Optional[torch.Tensor] = None
     if rollout_is is not None and rollout_is_threshold is not None:
         rollout_is_weights, is_metrics = compute_rollout_correction_weights(
             log_ratio=log_ratio,
@@ -790,6 +795,22 @@ def compute_rollout_correction_and_rejection_mask(
             rollout_is_batch_normalize=rollout_is_batch_normalize,
         )
         metrics.update(is_metrics)
+        # Adaptive Clipping Range (ACR), QuRL paper Eq.(9): r_i,t = min(1, C * π_behav/π_prox)
+        # π_behav/π_prox = exp(rollout_log_prob - old_log_prob) = exp(-log_ratio)
+        if rollout_acr_enabled:
+            log_ratio_acr = torch.clamp(-log_ratio, min=-SAFETY_BOUND, max=SAFETY_BOUND)
+            behav_over_prox = torch.exp(log_ratio_acr)
+            rollout_acr_r = torch.clamp(
+                rollout_is_threshold * behav_over_prox,
+                max=1.0,
+            ).to(response_mask.dtype)
+            rollout_acr_r = rollout_acr_r * response_mask  # mask padding
+            rollout_acr_r = rollout_acr_r.detach()
+            # ACR metrics for logging (r_i,t mean over valid tokens)
+            if response_mask.any():
+                acr_r_mean = verl_F.masked_mean(rollout_acr_r, response_mask).item()
+                metrics["acr_enabled"] = 1.0
+                metrics["acr_r_mean"] = acr_r_mean
 
     # Step 3: Compute rejection mask (if enabled)
     modified_response_mask: torch.Tensor = response_mask.clone()
@@ -823,10 +844,13 @@ def compute_rollout_correction_and_rejection_mask(
         else:
             metrics_scalar[f"rollout_corr/{key}"] = value
 
-    # Step 7: Wrap IS weights in DataProto for consistency with API
+    # Step 7: Wrap IS weights (and optional ACR r) in DataProto for consistency with API
     rollout_is_weights_proto: Optional[DataProto] = None
     if rollout_is_weights is not None:
-        rollout_is_weights_proto = DataProto.from_dict(tensors={"rollout_is_weights": rollout_is_weights})
+        tensors_dict: dict[str, torch.Tensor] = {"rollout_is_weights": rollout_is_weights}
+        if rollout_acr_r is not None:
+            tensors_dict["rollout_acr_r"] = rollout_acr_r
+        rollout_is_weights_proto = DataProto.from_dict(tensors=tensors_dict)
 
     return rollout_is_weights_proto, modified_response_mask, metrics_scalar
 
@@ -972,6 +996,7 @@ def compute_rollout_correction_and_add_to_batch(
     rollout_is = rollout_corr_config.get("rollout_is", None)
     rollout_is_threshold = rollout_corr_config.get("rollout_is_threshold", 2.0)
     rollout_is_batch_normalize = rollout_corr_config.get("rollout_is_batch_normalize", False)
+    rollout_acr_enabled = rollout_corr_config.get("rollout_acr_enabled", False)
     rollout_rs = rollout_corr_config.get("rollout_rs", None)
     rollout_rs_threshold = rollout_corr_config.get("rollout_rs_threshold", None)
 
@@ -983,6 +1008,7 @@ def compute_rollout_correction_and_add_to_batch(
         rollout_is=rollout_is,
         rollout_is_threshold=rollout_is_threshold,
         rollout_is_batch_normalize=rollout_is_batch_normalize,
+        rollout_acr_enabled=rollout_acr_enabled,
         rollout_rs=rollout_rs,
         rollout_rs_threshold=rollout_rs_threshold,
     )
@@ -993,6 +1019,13 @@ def compute_rollout_correction_and_add_to_batch(
     # Add IS weights to batch if computed
     if rollout_is_weights is not None:
         batch = batch.union(rollout_is_weights)
+        # Log when ACR is enabled and per-token r_i,t was added for policy loss
+        if rollout_acr_enabled and rollout_is is not None:
+            logger.info(
+                "[ACR] Adaptive Clipping Range (QuRL) enabled: per-token r_i,t computed and added to batch; "
+                "policy loss will use adaptive upper bound (1+ε)/r_i,t."
+            )
+            rollout_corr_metrics["rollout_corr/acr_applied"] = 1.0
 
     return batch, rollout_corr_metrics
 

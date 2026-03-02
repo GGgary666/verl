@@ -125,6 +125,12 @@ class RolloutCorrectionConfig(BaseConfig):
               Uses standard PPO loss with IS weight correction
             Default: False (decoupled mode)
 
+        rollout_acr_enabled (bool): Enable Adaptive Clipping Range (ACR) from QuRL paper (QURL.2602.13953).
+            When True and rollout_is is set, computes per-token r_i,t = min(1, C*π_behav/π_prox) and
+            uses adaptive upper clip bound (1+ε)/r_i,t in policy loss to mitigate long-horizon collapse
+            when behavior policy (quantized rollout) diverges from proximal policy (full-precision old).
+            Only applies in decoupled mode with IS weights. Default: False.
+
         loss_type (str): Loss function type in bypass mode (bypass_mode=True).
             - "reinforce": REINFORCE-style policy gradient with explicit IS weights
               L = -E[w * log π(a|s) * A] where w = π_current / π_rollout
@@ -175,6 +181,7 @@ class RolloutCorrectionConfig(BaseConfig):
     rollout_is_batch_normalize: bool = False
     rollout_rs: Optional[str] = None
     rollout_rs_threshold: Optional[str | float] = None
+    rollout_acr_enabled: bool = False
     bypass_mode: bool = False
     loss_type: str = "ppo_clip"
 

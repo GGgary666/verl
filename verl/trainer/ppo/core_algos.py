@@ -22,6 +22,7 @@ __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 
 from collections import defaultdict
 from enum import Enum
+import logging
 from typing import Any, Callable, Optional
 
 import numpy as np
@@ -33,6 +34,8 @@ from verl.trainer.config import AlgoConfig
 from verl.utils import as_torch_index, group_mean_std
 from verl.utils.import_utils import deprecated
 from verl.workers.config import ActorConfig
+
+logger = logging.getLogger(__name__)
 
 PolicyLossFn = Callable[
     [
@@ -48,6 +51,9 @@ PolicyLossFn = Callable[
 ]
 
 POLICY_LOSS_REGISTRY: dict[str, PolicyLossFn] = {}
+
+# One-time log when ACR is actually used in policy loss (per process)
+_acr_usage_logged = False
 
 
 def register_policy_loss(name: str) -> Callable[[PolicyLossFn], PolicyLossFn]:
@@ -1174,6 +1180,7 @@ def compute_policy_loss_vanilla(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    rollout_acr_r: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for PPO.
@@ -1227,9 +1234,17 @@ def compute_policy_loss_vanilla(
         cliprange_low = cliprange
     if cliprange_high is None:
         cliprange_high = cliprange
-    pg_losses2 = -advantages * torch.clamp(
-        ratio, 1 - cliprange_low, 1 + cliprange_high
-    )  # - clip(ratio, 1-cliprange, 1+cliprange) * A
+    # Adaptive Clipping Range (ACR), QuRL Eq.(9): upper bound = (1+ε)/r_i,t when r_i,t < 1 (truncated TIS)
+    if rollout_acr_r is not None:
+        r_safe = rollout_acr_r.clamp(min=1e-6)
+        clip_high_per_token = (1.0 + cliprange_high) / r_safe
+        # Clamp min accepts scalar; minimum needs both tensors
+        ratio_clipped = ratio.clamp(min=1 - cliprange_low)
+        pg_losses2 = -advantages * torch.minimum(ratio_clipped, clip_high_per_token)
+    else:
+        pg_losses2 = -advantages * torch.clamp(
+            ratio, 1 - cliprange_low, 1 + cliprange_high
+        )  # - clip(ratio, 1-cliprange, 1+cliprange) * A
     clip_pg_losses1 = torch.maximum(
         pg_losses1, pg_losses2
     )  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
@@ -1256,6 +1271,17 @@ def compute_policy_loss_vanilla(
         "actor/ppo_kl": ppo_kl.detach().item(),
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
     }
+    if rollout_acr_r is not None:
+        pg_metrics["actor/acr_used"] = 1.0
+        r_safe = rollout_acr_r.clamp(min=1e-6)
+        acr_r_mean = verl_F.masked_mean(r_safe, response_mask).detach().item()
+        pg_metrics["actor/acr_r_mean"] = acr_r_mean
+        global _acr_usage_logged
+        if not _acr_usage_logged:
+            logger.info(
+                "[ACR] Policy loss using Adaptive Clipping Range: adaptive upper bound (1+ε)/r_i,t applied."
+            )
+            _acr_usage_logged = True
     return pg_loss, pg_metrics
 
 
@@ -1268,6 +1294,7 @@ def compute_policy_loss_gspo(
     loss_agg_mode: str = "seq-mean-token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    rollout_acr_r: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for GSPO.
@@ -1310,7 +1337,17 @@ def compute_policy_loss_gspo(
     seq_importance_ratio = torch.exp(log_seq_importance_ratio)
 
     pg_losses1 = -advantages * seq_importance_ratio
-    pg_losses2 = -advantages * torch.clamp(seq_importance_ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
+    # Adaptive Clipping Range (ACR), QuRL Eq.(9): upper bound = (1+ε)/r_i,t
+    if rollout_acr_r is not None:
+        r_safe = rollout_acr_r.clamp(min=1e-6)
+        clip_high_per_token = (1.0 + clip_ratio_high) / r_safe
+        # Clamp min accepts scalar; minimum needs both tensors
+        ratio_clipped = seq_importance_ratio.clamp(min=1 - clip_ratio_low)
+        pg_losses2 = -advantages * torch.minimum(ratio_clipped, clip_high_per_token)
+    else:
+        pg_losses2 = -advantages * torch.clamp(
+            seq_importance_ratio, 1 - clip_ratio_low, 1 + clip_ratio_high
+        )
     pg_losses = torch.maximum(pg_losses1, pg_losses2)
 
     # Apply rollout correction weights if provided
@@ -1332,6 +1369,17 @@ def compute_policy_loss_gspo(
         "actor/ppo_kl": ppo_kl.detach().item(),
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
     }
+    if rollout_acr_r is not None:
+        pg_metrics["actor/acr_used"] = 1.0
+        r_safe = rollout_acr_r.clamp(min=1e-6)
+        acr_r_mean = verl_F.masked_mean(r_safe, response_mask).detach().item()
+        pg_metrics["actor/acr_r_mean"] = acr_r_mean
+        global _acr_usage_logged
+        if not _acr_usage_logged:
+            logger.info(
+                "[ACR] Policy loss using Adaptive Clipping Range: adaptive upper bound (1+ε)/r_i,t applied."
+            )
+            _acr_usage_logged = True
     return pg_loss, pg_metrics
 
 
@@ -1344,6 +1392,7 @@ def compute_policy_loss_sapo(
     loss_agg_mode: str = "seq-mean-token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    rollout_acr_r: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the smoothed policy objective and related metrics for SAPO.
@@ -1429,6 +1478,7 @@ def compute_policy_loss_gpg(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    rollout_acr_r: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Adapted from
     https://github.com/AMAP-ML/GPG/blob/main/VisualThinker-R1-Zero/src/open-r1-multimodal/src/open_r1/trainer/grpo_trainer.py#L495
@@ -1465,6 +1515,7 @@ def compute_policy_loss_clip_cov(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    rollout_acr_r: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for Clip-Cov.
@@ -1570,6 +1621,7 @@ def compute_policy_loss_kl_cov(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    rollout_acr_r: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for Clip-Cov.
@@ -1650,6 +1702,7 @@ def compute_policy_loss_geo_mean(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    rollout_acr_r: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for GMPO.
@@ -1736,6 +1789,7 @@ def compute_policy_loss_cispo(
     loss_agg_mode: str = "token-mean",
     config: Optional[DictConfig | ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    rollout_acr_r: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
     Compute the clipped policy objective and related metrics for CISPO.
@@ -2079,6 +2133,7 @@ def compute_policy_loss_bypass_mode(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    rollout_acr_r: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Bypass mode policy loss supporting both REINFORCE and PPO-clip.
 

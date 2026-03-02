@@ -127,6 +127,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     old_log_prob = data["old_log_probs"]
     advantages = data["advantages"]
     rollout_is_weights = data.get("rollout_is_weights", None)
+    rollout_acr_r = data.get("rollout_acr_r", None)
 
     loss_agg_mode = config.loss_agg_mode
 
@@ -141,6 +142,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         loss_agg_mode=loss_agg_mode,
         config=config,
         rollout_is_weights=rollout_is_weights,
+        rollout_acr_r=rollout_acr_r,
     )
 
     # AggregationType.MEAN for pg metrics: assumes policy_loss_fn normalizes by local_bsz/local_tokens

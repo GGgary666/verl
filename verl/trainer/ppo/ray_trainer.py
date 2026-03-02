@@ -1454,6 +1454,10 @@ class RayPPOTrainer:
                         # Compute rollout correction: IS weights, rejection sampling, and metrics
                         # Only runs in decoupled mode (computes once per batch using stable π_old)
                         # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
+                        rollout_acr_enabled = (
+                            rollout_corr_config is not None
+                            and rollout_corr_config.get("rollout_acr_enabled", False)
+                        )
                         if (
                             rollout_corr_config is not None
                             and "rollout_log_probs" in batch.batch
@@ -1465,6 +1469,18 @@ class RayPPOTrainer:
                             batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
                             # IS and off-policy metrics already have rollout_corr/ prefix
                             metrics.update(is_metrics)
+                            if rollout_acr_enabled:
+                                metrics["rollout_corr/acr_applied"] = 1.0
+                        else:
+                            # ACR was enabled but rollout correction did not run (no rollout_log_probs or bypass mode)
+                            if rollout_acr_enabled:
+                                import logging
+                                logging.getLogger(__name__).warning(
+                                    "[ACR] rollout_acr_enabled=True but ACR was NOT applied: "
+                                    "'rollout_log_probs' is required in batch (ensure rollout/agent_loop returns log probs) "
+                                    "and decoupled mode (bypass_mode=False)."
+                                )
+                                metrics["rollout_corr/acr_applied"] = 0.0
 
                         # compute advantages, executed on the driver process
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(

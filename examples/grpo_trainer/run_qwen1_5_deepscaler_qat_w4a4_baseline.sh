@@ -1,0 +1,109 @@
+set -x
+
+# 解析当前脚本的绝对路径，方便后面拷贝
+SCRIPT_PATH="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+
+export VLLM_LOGGING_LEVEL=WARNING
+export VERL_LOGGING_LEVEL=INFO
+export VLLM_CONFIGURE_LOGGING=0
+
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export TORCHDYNAMO_VERBOSE=1
+export TORCH_COMPILE_DISABLE=1
+export TORCH_NCCL_AVOID_RECORD_STREAMS=1
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+
+ROOT_DIR=/workspace/gg/logs/
+EXP_NAME=qwen1_5_deepscaler_qat_w4a4_baseline_8k
+
+# DeepScaleR 8K Context: BS=128*8=1024, ~1040 steps, 8xA100-80GB
+VERL_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+qat_config_path="${qat_config_path:-"${VERL_ROOT}/recipe/qat/config/nvfp4_w4a4.json"}"
+export TENSORBOARD_DIR=/root/data/gg/tmp_logs/$EXP_NAME/tensorboard
+mkdir -p $ROOT_DIR
+mkdir -p $ROOT_DIR/$EXP_NAME
+mkdir -p $TENSORBOARD_DIR
+
+# 将当前训练脚本和运行命令记录到 tensorboard 目录，便于之后溯源
+cp "$SCRIPT_PATH" "$TENSORBOARD_DIR/$(basename "$SCRIPT_PATH")"
+{
+  echo "Run time: $(date)"
+  echo "Script : $SCRIPT_PATH"
+  echo "Command: $SCRIPT_PATH $*"
+} > "$TENSORBOARD_DIR/run_command.txt"
+
+# Algorithm - 8K context (DeepScaleR: output limited to 8K for efficient CoT)
+temperature=1.0
+top_p=1.0
+top_k=-1  # 0 for HF rollout, -1 for vLLM rollout
+val_top_p=0.7
+max_prompt_length=$((1024 * 2))
+max_response_length=$((1024 * 8))   # 8K tokens (DeepScaleR paper)
+train_max_samples=-1
+val_max_samples=-1
+
+python3 -m verl.trainer.main_ppo \
+    algorithm.adv_estimator=grpo \
+    algorithm.rollout_correction.rollout_is=token \
+    algorithm.rollout_correction.rollout_is_threshold=2.0 \
+    algorithm.rollout_correction.rollout_acr_enabled=False \
+    actor_rollout_ref.rollout.calculate_log_probs=True \
+    data.train_files=/xpfs/fp4/gg/datasets/DeepScaleR-Preview-Dataset-verl-format/train.parquet \
+    data.val_files=/xpfs/fp4/gg/datasets/DeepScaleR-Preview-Dataset-verl-format/test.parquet \
+    data.train_max_samples=${train_max_samples} \
+    data.val_max_samples=${val_max_samples} \
+    data.train_batch_size=128 \
+    data.max_prompt_length=${max_prompt_length} \
+    data.max_response_length=${max_response_length} \
+    data.filter_overlong_prompts=True \
+    data.truncation='error' \
+    actor_rollout_ref.model.path=/xpfs/fp4/dpj/la_models/Qwen3-1.7B \
+    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.model.use_remove_padding=True \
+    actor_rollout_ref.actor.ppo_mini_batch_size=128 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.actor.use_kl_loss=True \
+    actor_rollout_ref.actor.kl_loss_coef=0.001 \
+    actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    actor_rollout_ref.actor.entropy_coeff=0 \
+    actor_rollout_ref.actor.use_torch_compile=False \
+    actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    actor_rollout_ref.actor.qat.enable=True \
+    actor_rollout_ref.actor.qat.mode=w4a4 \
+    actor_rollout_ref.actor.qat.quantization_config_path="${qat_config_path}" \
+    'actor_rollout_ref.actor.qat.ignore_patterns=["lm_head", "embed_tokens", "re:.*mlp.gate$"]' \
+    actor_rollout_ref.actor.fsdp_config.param_offload=False \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+    actor_rollout_ref.actor.entropy_from_logits_with_chunking=True \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=4096 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+    actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.80 \
+    actor_rollout_ref.rollout.max_num_batched_tokens=$((max_prompt_length + max_response_length)) \
+    actor_rollout_ref.rollout.enable_chunked_prefill=True \
+    actor_rollout_ref.rollout.temperature=${temperature} \
+    actor_rollout_ref.rollout.top_p=${top_p} \
+    actor_rollout_ref.rollout.top_k=${top_k} \
+    actor_rollout_ref.rollout.val_kwargs.temperature=${temperature} \
+    actor_rollout_ref.rollout.val_kwargs.top_p=${val_top_p} \
+    actor_rollout_ref.rollout.val_kwargs.top_k=${top_k} \
+    actor_rollout_ref.rollout.val_kwargs.do_sample=True \
+    actor_rollout_ref.rollout.val_kwargs.n=1 \
+    actor_rollout_ref.rollout.n=8 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.ref.fsdp_config.param_offload=False \
+    actor_rollout_ref.ref.entropy_from_logits_with_chunking=True \
+    algorithm.use_kl_in_reward=False \
+    actor_rollout_ref.nccl_timeout=1800 \
+    trainer.critic_warmup=0 \
+    trainer.logger='["console","tensorboard"]' \
+    trainer.project_name=$EXP_NAME \
+    trainer.experiment_name=$EXP_NAME \
+    trainer.default_local_dir=$ROOT_DIR/$EXP_NAME \
+    trainer.n_gpus_per_node=8 \
+    trainer.nnodes=1 \
+    trainer.save_freq=0 \
+    trainer.test_freq=10 \
+    trainer.log_val_generations=5 \
+    trainer.total_epochs=8 $@ | tee -a $ROOT_DIR/$EXP_NAME.log
