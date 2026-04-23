@@ -1151,6 +1151,27 @@ class RayPPOTrainer:
             old_log_prob_mfu = 0
         return old_log_prob, old_log_prob_mfu
 
+    def _compute_old_bf16_log_prob(self, batch: DataProto):
+        """Compute BF16 anchor log-probs using actor teacher-forward implementation."""
+        if self.use_legacy_worker_impl == "disable":
+            batch_td = batch.to_tensordict()
+            batch_td = left_right_2_no_padding(batch_td)
+            tu.assign_non_tensor(batch_td, calculate_entropy=False, compute_loss=False)
+            output = self.actor_rollout_wg.compute_teacher_log_prob(batch_td)
+            log_probs = tu.get(output, "old_bf16_log_probs")
+            old_bf16_log_prob_mfu = tu.get(output, "metrics")["mfu"]
+            bf16_log_probs = no_padding_2_padding(log_probs, batch_td)
+            bf16_log_prob = tu.get_tensordict({"old_bf16_log_probs": bf16_log_probs.float()})
+            bf16_log_prob = DataProto.from_tensordict(bf16_log_prob)
+        else:
+            bf16_log_prob = self.actor_rollout_wg.compute_teacher_log_prob(batch)
+            old_bf16_log_prob_mfu = 0
+            if "old_log_probs" in bf16_log_prob.batch:
+                bf16_log_prob.batch["old_bf16_log_probs"] = bf16_log_prob.batch.pop("old_log_probs")
+            elif "log_probs" in bf16_log_prob.batch:
+                bf16_log_prob.batch["old_bf16_log_probs"] = bf16_log_prob.batch.pop("log_probs")
+        return bf16_log_prob, old_bf16_log_prob_mfu
+
     def _update_actor(self, batch: DataProto) -> DataProto:
         rollout_config = self.config.actor_rollout_ref.rollout
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
@@ -1422,6 +1443,26 @@ class RayPPOTrainer:
                                 from verl.utils.debug.metrics import calculate_debug_metrics
 
                                 metrics.update(calculate_debug_metrics(batch))
+
+                    actor_cfg = self.config.actor_rollout_ref.actor
+                    self_distill_enable = bool(actor_cfg.get("self_distill_enable", False))
+                    self_distill_coef = float(actor_cfg.get("self_distill_coef", 0.001))
+                    self_distill_teacher_forward_mode = str(
+                        actor_cfg.get("self_distill_teacher_forward_mode", "per_micro_batch")
+                    )
+                    need_old_bf16_log_probs = (
+                        self_distill_enable
+                        and self_distill_coef > 0.0
+                        and self_distill_teacher_forward_mode == "per_train_batch"
+                    )
+                    if (
+                        need_old_bf16_log_probs
+                        and "old_bf16_log_probs" not in batch.batch
+                    ):
+                        with marked_timer("old_bf16_log_prob", timing_raw, color="blue"):
+                            old_bf16_log_prob, old_bf16_log_prob_mfu = self._compute_old_bf16_log_prob(batch)
+                            batch = batch.union(old_bf16_log_prob)
+                            metrics["perf/mfu/actor_infer_bf16_anchor"] = old_bf16_log_prob_mfu
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 

@@ -176,6 +176,10 @@ class ActorConfig(BaseConfig):
     rollout_n: int = MISSING  # must be override by sampling config
     model_config: HFModelConfig = field(default_factory=BaseConfig)
     router_replay: RouterReplayConfig = field(default_factory=RouterReplayConfig)
+    self_distill_enable: bool = False
+    self_distill_coef: float = 0.001
+    self_distill_loss_type: str = "low_var_kl"
+    self_distill_teacher_forward_mode: str = "per_micro_batch"
 
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size
@@ -208,6 +212,17 @@ class ActorConfig(BaseConfig):
         ]
         if self.loss_agg_mode not in valid_loss_agg_modes:
             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
+
+        if self.self_distill_loss_type not in {"abs_logprob", "mse", "low_var_kl"}:
+            raise ValueError(
+                "Invalid self_distill_loss_type: "
+                f"{self.self_distill_loss_type}. Must be 'abs_logprob', 'mse', or 'low_var_kl'."
+            )
+        if self.self_distill_teacher_forward_mode not in {"per_micro_batch", "per_train_batch"}:
+            raise ValueError(
+                "Invalid self_distill_teacher_forward_mode: "
+                f"{self.self_distill_teacher_forward_mode}. Must be 'per_micro_batch' or 'per_train_batch'."
+            )
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""

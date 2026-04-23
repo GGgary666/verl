@@ -88,6 +88,19 @@ loss_scale_factor: null
 # Entropy regularization coefficient in PPO loss
 entropy_coeff: 0
 
+# Enable self-distill auxiliary loss.
+self_distill_enable: false
+
+# Coefficient for self-distill auxiliary loss.
+# Recommended range: 0.001 ~ 0.01.
+self_distill_coef: 0.001
+
+# Self-distill objective type: abs_logprob, mse, or low_var_kl.
+self_distill_loss_type: low_var_kl
+
+# Teacher forward scheduling mode: per_micro_batch or per_train_batch.
+self_distill_teacher_forward_mode: per_micro_batch
+
 # When true, the actor forward will request entropy from the model
 calculate_entropy: false
 

@@ -251,6 +251,30 @@ class TestActorConfig(unittest.TestCase):
             config.validate(n_gpus=16, train_batch_size=512)
         self.assertIn("must be >= n_gpus", str(cm.exception))
 
+    def test_self_distill_loss_type_default_and_validation(self):
+        """Test self-distill loss type default and validation."""
+        optim = OptimizerConfig(lr=0.1)
+        config = ActorConfig(
+            strategy="fsdp",
+            use_dynamic_bsz=True,
+            ppo_micro_batch_size_per_gpu=4,
+            optim=optim,
+            rollout_n=1,
+        )
+        self.assertEqual(config.self_distill_loss_type, "low_var_kl")
+        self.assertEqual(config.self_distill_coef, 0.001)
+
+        with self.assertRaises(ValueError) as cm:
+            ActorConfig(
+                strategy="fsdp",
+                use_dynamic_bsz=True,
+                ppo_micro_batch_size_per_gpu=4,
+                optim=optim,
+                rollout_n=1,
+                self_distill_loss_type="invalid",
+            )
+        self.assertIn("Invalid self_distill_loss_type", str(cm.exception))
+
 
 if __name__ == "__main__":
     unittest.main()
