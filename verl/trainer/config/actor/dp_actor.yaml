@@ -78,6 +78,29 @@ qat:
   # Activation observer for W4A4 mode: "static_minmax", "memoryless_minmax", or "minmax"
   activation_observer: "static_minmax"
 
+  # Update interval for W4A4 activation observer state updates (1 = update every forward)
+  activation_observer_update_interval: 8
+
+  # Freeze W4A4 activation observer updates after this many forwards (-1 = never freeze)
+  activation_observer_freeze_after_steps: -1
+
+  # Sync interval for W4A4 activation observer all-reduce (1 = sync every forward)
+  activation_observer_sync_interval: 8
+
+  # Whether actor forward uses QAT fake quantization during training.
+  # false: actor forward runs BF16/FP while keeping QAT modules for rollout export.
+  train_fake_quant_enable: true
+
+  # Effective only when train_fake_quant_enable=false and mode=w4a4.
+  # Keep updating W4A4 input_amax/input_global_scale observers in BF16/FP forward.
+  observe_w4a4_input_scale_in_bf16_forward: true
+
+  # Fake-quant Triton kernel implementation: "legacy", "nvfp4", or "torchao_real"
+  fake_quant_kernel_impl: "nvfp4"
+
+  # W4A4: fuse decoder RMSNorm + activation fake-quant (q/k/v & gate/up skip per-linear act FQ)
+  fuse_w4a4_rms_norm_activation: true
+
   # Path to vLLM quantization config JSON file
   quantization_config_path: null
 

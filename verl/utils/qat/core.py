@@ -38,11 +38,26 @@ class QATConfig(BaseConfig):
     group_size: int = 16
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
+    activation_observer_update_interval: int = 1
+    activation_observer_freeze_after_steps: int = -1
+    activation_observer_sync_interval: int = 1
+    fake_quant_kernel_impl: str = "legacy"
     quantization_config_path: Optional[str] = None
+    # Whether actor forward uses QAT fake quantization during training.
+    # False enables BF16/FP forward on QATLinear weights.
+    train_fake_quant_enable: bool = True
+    # When train_fake_quant_enable=False and mode is W4A4, keep updating
+    # input_amax/input_global_scale observers in BF16 forward for rollout export.
+    observe_w4a4_input_scale_in_bf16_forward: bool = True
     # Update-Aware Quantization (UAQ) from QuRL paper (QURL.2602.13953)
     # Invariant scaling s > 1 reduces quantization error and amplifies weight updates (s^2 improvement).
     # Default 1.0 disables UAQ; use 1.5 for INT8/FP8 per paper ablation.
     uaq_scale: float = 1.0
+    # When True (W4A4 only): replace decoder ``input_layernorm`` / ``post_attention_layernorm``
+    # with ``FusedRMSNormFakeQuant`` (RMSNorm + activation fake-quant once). ``q/k/v`` and
+    # ``gate/up`` QATLinear modules skip per-linear activation fake-quant; ``o_proj`` and
+    # ``down_proj`` keep activation fake-quant. Intended for dense Qwen3-style stacks.
+    fuse_w4a4_rms_norm_activation: bool = False
 
 
 def _is_global_rank_zero() -> bool:
@@ -72,8 +87,39 @@ def load_quantization_config(qat_config: QATConfig) -> dict[str, Any]:
         if original_ignore != qat_config.ignore_patterns:
             logger.info(f"Overriding JSON 'ignore' field: {original_ignore} -> {qat_config.ignore_patterns}")
 
+    # Validate mode vs quantization config consistency.
+    # A mismatch (e.g. mode=w4a16 with a W4A4 config, or vice-versa) causes vLLM
+    # to create the wrong scheme, leading to corrupted inference (garbage
+    # input_global_scale → invalid alpha → short/broken rollout outputs).
+    _validate_mode_vs_config(qat_config.mode, quant_config, qat_config.quantization_config_path)
+
     logger.info("Successfully loaded QAT quantization config")
     return quant_config
+
+
+def _validate_mode_vs_config(mode: str, quant_config: dict, config_path: str) -> None:
+    """Validate that QAT mode matches the quantization config's input_activations field.
+
+    Raises ValueError on mismatch so the user gets a clear, early error instead of
+    silently corrupted inference weights.
+    """
+    config_groups = quant_config.get("config_groups", {})
+    for group_name, group_cfg in config_groups.items():
+        has_input_act = group_cfg.get("input_activations") is not None
+        if mode == "w4a16" and has_input_act:
+            raise ValueError(
+                f"[QAT] Mode/config mismatch: mode='w4a16' but quantization config "
+                f"'{config_path}' has input_activations in group '{group_name}'. "
+                f"W4A16 requires input_activations=null. "
+                f"Use the W4A16 config (e.g. nvfp4_w4a16.json) or change mode to 'w4a4'."
+            )
+        if mode == "w4a4" and not has_input_act:
+            raise ValueError(
+                f"[QAT] Mode/config mismatch: mode='w4a4' but quantization config "
+                f"'{config_path}' has no input_activations in group '{group_name}'. "
+                f"W4A4 requires input_activations to be specified. "
+                f"Use the W4A4 config (e.g. nvfp4_w4a4.json) or change mode to 'w4a16'."
+            )
 
 
 def apply_update_aware_quantization(
@@ -248,7 +294,12 @@ def apply_qat(
         )
 
     mode = QATMode(config.mode.lower())
-    logger.info(f"Applying QAT with mode={mode.value}, group_size={config.group_size}")
+    logger.info(
+        "Applying QAT with mode=%s, group_size=%s, fake_quant_kernel_impl=%s",
+        mode.value,
+        config.group_size,
+        config.fake_quant_kernel_impl,
+    )
 
     modules_to_replace = []
     for name, module in model.named_modules():
@@ -267,12 +318,26 @@ def apply_qat(
             mode=mode,
             group_size=config.group_size,
             activation_observer=config.activation_observer,
+            activation_observer_update_interval=config.activation_observer_update_interval,
+            activation_observer_freeze_after_steps=config.activation_observer_freeze_after_steps,
+            activation_observer_sync_interval=config.activation_observer_sync_interval,
+            fake_quant_kernel_impl=config.fake_quant_kernel_impl,
         )
 
         _set_module(model, name, fake_quant_module)
         converted_count += 1
 
     logger.info(f"Successfully applied QAT to {converted_count} layers")
+
+    if config.enable and config.mode == "w4a4" and getattr(config, "fuse_w4a4_rms_norm_activation", False):
+        from verl.utils.qat.fused_rms_norm_fake_quant import apply_w4a4_fused_rms_norm_fake_quant
+
+        n_norm, n_skip = apply_w4a4_fused_rms_norm_fake_quant(model, config)
+        if n_norm == 0 and _is_global_rank_zero():
+            logger.warning(
+                "[QAT][FusedRMSNormFakeQuant] No RMSNorm modules were replaced. "
+                "Check model has paths like '*.layers.*.input_layernorm' / 'post_attention_layernorm'."
+            )
 
     return model
 
@@ -331,15 +396,122 @@ def enable_qat_fuse(model: nn.Module):
 
 
 def invalidate_all_scales(model: nn.Module):
-    """Clear all cached weight scales after optimizer.step()."""
+    """Clear cached QAT weight scales/amax states.
+
+    Must be called after ``optimizer.step()`` (i.e. once per optimizer step), since
+    weight values change there. Clearing earlier (e.g. between grad-accum
+    micro-batches) would defeat the cache and force a re-quant on every micro-batch.
+    """
     from verl.utils.qat.linear import QATLinear
 
     count = 0
     for module in model.modules():
         if isinstance(module, QATLinear):
-            module._weight_blockwise_scale = None
-            module._weight_global_scale = None
             module._cached_weight_amax = None
             count += 1
 
-    logger.debug(f"[QAT Fuse] Invalidated scales for {count} QATLinear layers")
+    logger.debug(f"[QAT] Invalidated scales for {count} QATLinear layers")
+
+
+def set_qat_runtime_mode(
+    model: nn.Module,
+    *,
+    fake_quant_enabled: bool,
+    observe_input_scale_only: bool = False,
+):
+    """Set runtime mode for all QATLinear and FusedRMSNormFakeQuant layers.
+
+    Args:
+        model: Module containing QATLinear layers.
+        fake_quant_enabled: Whether fake quant is active in forward.
+        observe_input_scale_only: If True and fake quant is disabled, W4A4 layers
+            still update input scale observers during BF16/FP forward.
+    """
+    from verl.utils.qat.linear import QATLinear
+
+    try:
+        from verl.utils.qat.fused_rms_norm_fake_quant import FusedRMSNormFakeQuant
+    except Exception:
+        FusedRMSNormFakeQuant = None
+
+    updated = 0
+    for module in model.modules():
+        if isinstance(module, QATLinear):
+            module.fake_quant_enabled = bool(fake_quant_enabled)
+            module.observe_input_scale_only = bool(observe_input_scale_only and not fake_quant_enabled)
+            updated += 1
+        elif FusedRMSNormFakeQuant is not None and isinstance(module, FusedRMSNormFakeQuant):
+            module.fake_quant_enabled = bool(fake_quant_enabled)
+            module.observe_input_scale_only = bool(observe_input_scale_only and not fake_quant_enabled)
+            updated += 1
+
+    logger.warning(
+        "[QAT Runtime] Set mode: fake_quant_enabled=%s, observe_input_scale_only=%s, qat_layers=%d",
+        bool(fake_quant_enabled),
+        bool(observe_input_scale_only and not fake_quant_enabled),
+        updated,
+    )
+
+
+def reset_activation_observer_update_dedup(model: nn.Module) -> int:
+    """Clear per-step observer dedup so the next train step can update observers.
+
+    Calibration runs at train step 0 and leaves ``_last_activation_observer_update_step``
+    at 0; without reset, the first real training step at optimizer step 0 is skipped.
+    """
+    count = 0
+    for module in model.modules():
+        if hasattr(module, "_last_activation_observer_update_step"):
+            module._last_activation_observer_update_step = -1
+            count += 1
+    return count
+
+
+def enable_batched_amax_sync(model: nn.Module) -> int:
+    """Enable batched activation observer amax sync for all W4A4 QAT modules.
+
+    Instead of 144 individual scalar ``all_reduce`` calls (one per QATLinear /
+    FusedRMSNormFakeQuant module per forward pass), modules store their local
+    amax and defer the sync to a single batched ``all_reduce`` via
+    :func:`sync_activation_observer_amax`.
+
+    Returns the number of modules switched to batched mode.
+    """
+    from verl.utils.qat.linear import QATLinear
+
+    count = 0
+    for module in model.modules():
+        if hasattr(module, "_use_batched_amax_sync"):
+            module._use_batched_amax_sync = True
+            count += 1
+    if count > 0:
+        model._qat_batched_amax_sync = True
+    if _is_global_rank_zero():
+        logger.info("[QAT] Enabled batched amax sync for %d modules", count)
+    return count
+
+
+def sync_activation_observer_amax(model: nn.Module) -> None:
+    """Batch-sync pending activation observer amax values across ranks.
+
+    Collects ``_pending_local_amax`` from all QATLinear / FusedRMSNormFakeQuant
+    modules, performs one ``all_reduce(MAX)``, then calls each module's
+    ``_apply_amax_to_observer`` with the synced value.
+    """
+    modules_with_pending: list[nn.Module] = []
+    for module in model.modules():
+        if getattr(module, "_pending_local_amax", None) is not None:
+            modules_with_pending.append(module)
+
+    if not modules_with_pending:
+        return
+
+    amax_tensor = torch.stack([m._pending_local_amax for m in modules_with_pending])
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        dist.all_reduce(amax_tensor, op=dist.ReduceOp.MAX)
+
+    for i, module in enumerate(modules_with_pending):
+        module._apply_amax_to_observer(amax_tensor[i])
+        module._pending_local_amax = None
+
+

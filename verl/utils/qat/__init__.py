@@ -34,9 +34,13 @@ from verl.utils.qat.core import (
     QATConfig,
     apply_qat,
     apply_update_aware_quantization,
+    enable_batched_amax_sync,
     enable_qat_fuse,
     invalidate_all_scales,
     load_quantization_config,
+    reset_activation_observer_update_dedup,
+    set_qat_runtime_mode,
+    sync_activation_observer_amax,
 )
 from verl.utils.qat.vllm_patch import (
     apply_qat_patches,
@@ -49,9 +53,13 @@ __all__ = [
     "QATConfig",
     "apply_qat",
     "apply_update_aware_quantization",
+    "enable_batched_amax_sync",
     "load_quantization_config",
     "enable_qat_fuse",
     "invalidate_all_scales",
+    "reset_activation_observer_update_dedup",
+    "set_qat_runtime_mode",
+    "sync_activation_observer_amax",
     # vLLM Patch
     "apply_qat_patches",
     "manual_process_weights_after_loading",

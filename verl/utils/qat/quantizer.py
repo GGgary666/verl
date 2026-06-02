@@ -74,6 +74,18 @@ def compute_blockwise_scale(
     return blockwise_scale
 
 
+def compute_weight_global_scale(weight: torch.Tensor) -> torch.Tensor:
+    """Compute per-layer global scale using the same QAT quantizer rule."""
+    amax = torch.amax(torch.abs(weight)).to(torch.float32)
+    return generate_gparam(
+        -amax.unsqueeze(0),
+        amax.unsqueeze(0),
+        scale_data=FP8_E4M3_DATA,
+        quant_data=FP4_E2M1_DATA,
+        dtype=torch.float32,
+    )
+
+
 # Fusion patterns for transformer models
 FUSE_PATTERNS = {
     "qkv": ["q_proj", "k_proj", "v_proj"],
@@ -223,6 +235,7 @@ class QATQuantizer:
         fused_global_scales = fuse_global_scales(layer_global_scales, strategy="min")
 
         results = []
+        _log_once = not hasattr(self, "_diag_logged")
 
         for layer_name, weight_gpu in weights_on_gpu.items():
             fused_global_scale = fused_global_scales[layer_name]
@@ -233,6 +246,23 @@ class QATQuantizer:
                 global_scale=fused_global_scale,
                 quantization_args=self._quant_args,
             )["weight_packed"]
+
+            # Log first-layer diagnostics once per quantize call for debugging
+            if _log_once:
+                _ws_fp32 = weight_scale.float()
+                logger.warning(
+                    "[QAT Quantizer] mode=%s, layer=%s, "
+                    "weight_shape=%s, weight_dtype=%s, "
+                    "global_scale=%.6g, block_scale min/max=%.6g/%.6g, "
+                    "packed_shape=%s, packed_dtype=%s",
+                    self.mode, layer_name,
+                    tuple(weight_gpu.shape), weight_gpu.dtype,
+                    fused_global_scale.item(),
+                    _ws_fp32.min().item(), _ws_fp32.max().item(),
+                    tuple(weight_packed.shape), weight_packed.dtype,
+                )
+                self._diag_logged = True
+                _log_once = False
 
             results.append((f"{layer_name}.weight_packed", weight_packed.to(output_device)))
             results.append((f"{layer_name}.weight_scale", weight_scale.to(output_device)))
@@ -275,16 +305,20 @@ class QATQuantizer:
         layer_buffer: dict[str, torch.Tensor] = {}
         input_global_scales: dict[str, torch.Tensor] = {}
         for name, tensor in params:
-            tensor_cpu = tensor.to("cpu") if tensor.is_cuda else tensor
+            # Keep incoming tensors on their original device to avoid an extra
+            # CPU<->GPU ping-pong in the hot path:
+            #   old path: full_tensor(on GPU) -> CPU (here) -> GPU (_process_layer_group)
+            # We still move outputs to `target_device` at emit time.
+            tensor_local = tensor
             layer_idx = self._extract_layer_idx(name)
 
             # Collect input_global_scales for W4A4 as we go
             if self._is_w4a4 and "input_global_scale" in name:
                 scale_layer_name = name.replace(".input_global_scale", "")
-                if tensor_cpu.numel() == 1 and tensor_cpu.item() == -1.0:
+                if tensor_local.numel() == 1 and tensor_local.item() == -1.0:
                     logger.warning(f"W4A4: {scale_layer_name} input_global_scale is uninitialized")
                 else:
-                    input_global_scales[scale_layer_name] = tensor_cpu
+                    input_global_scales[scale_layer_name] = tensor_local
 
             # Layer boundary: flush previous layer
             if layer_idx != current_layer_idx and current_layer_idx is not _sentinel and layer_buffer:
@@ -294,7 +328,7 @@ class QATQuantizer:
                 layer_buffer = {}
 
             current_layer_idx = layer_idx
-            layer_buffer[name] = tensor_cpu
+            layer_buffer[name] = tensor_local
 
         # Flush last buffered layer
         if layer_buffer:
@@ -304,5 +338,8 @@ class QATQuantizer:
 
 
 __all__ = [
+    "compute_blockwise_scale",
+    "compute_weight_global_scale",
+    "fuse_global_scales",
     "QATQuantizer",
 ]

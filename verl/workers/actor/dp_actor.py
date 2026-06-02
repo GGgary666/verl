@@ -111,8 +111,43 @@ class DataParallelPPOActor(BasePPOActor):
                 f"{self.use_fused_kernels=} or {self.use_prefix_grouper=} for now."
             )
 
+        self._compiled_actor_model_forward_old_log_prob = None
+        self._compiled_actor_model_forward_teacher = None
+        if self.config.get("compile_forward_for_old_log_prob", False):
+            self._compiled_actor_model_forward_old_log_prob = torch.compile(
+                self._actor_model_forward_impl, dynamic=True
+            )
+        if self.config.get("compile_forward_for_self_distill_teacher", False):
+            self._compiled_actor_model_forward_teacher = torch.compile(
+                self._actor_model_forward_impl, dynamic=True
+            )
+        self._qat_optimizer_step = 0
+
+    def _set_qat_observer_train_step(self, step: int):
+        """Propagate optimizer-step index to all QATLinear modules."""
+        for module in self.actor_module.modules():
+            setter = getattr(module, "set_activation_observer_train_step", None)
+            if callable(setter):
+                setter(step)
+
+    def _actor_model_forward_impl(self, **model_kwargs):
+        """Forward helper so we can optionally torch.compile no-grad recompute paths."""
+        return self.actor_module(**model_kwargs)
+
+    def _actor_model_forward(self, model_kwargs: dict, forward_mode: str):
+        """Dispatch actor forward according to recompute mode."""
+        if forward_mode == "old_log_prob" and self._compiled_actor_model_forward_old_log_prob is not None:
+            return self._compiled_actor_model_forward_old_log_prob(**model_kwargs)
+        if forward_mode == "teacher" and self._compiled_actor_model_forward_teacher is not None:
+            return self._compiled_actor_model_forward_teacher(**model_kwargs)
+        return self._actor_model_forward_impl(**model_kwargs)
+
     def _forward_micro_batch(
-        self, micro_batch: dict[str, torch.Tensor], temperature: float, calculate_entropy: bool = False
+        self,
+        micro_batch: dict[str, torch.Tensor],
+        temperature: float,
+        calculate_entropy: bool = False,
+        forward_mode: str = "default",
     ) -> dict[str, torch.Tensor]:
         """
         Returns:
@@ -242,13 +277,17 @@ class DataParallelPPOActor(BasePPOActor):
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
 
-                output = self.actor_module(
-                    input_ids=input_ids_rmpad,
-                    attention_mask=None,
-                    position_ids=position_ids_rmpad,
+                model_kwargs = {
+                    "input_ids": input_ids_rmpad,
+                    "attention_mask": None,
+                    "position_ids": position_ids_rmpad,
                     **multi_modal_inputs,
-                    use_cache=False,
+                    "use_cache": False,
                     **extra_args,
+                }
+                output = self._actor_model_forward(
+                    model_kwargs=model_kwargs,
+                    forward_mode=forward_mode,
                 )  # prevent model thinks we are generating
 
                 if self.use_fused_kernels:
@@ -350,13 +389,17 @@ class DataParallelPPOActor(BasePPOActor):
                     extra_args["temperature"] = temperature
                     extra_args["return_dict"] = True
 
-                output = self.actor_module(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
+                model_kwargs = {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "position_ids": position_ids,
                     **multi_modal_inputs,
-                    use_cache=False,
+                    "use_cache": False,
                     **extra_args,
+                }
+                output = self._actor_model_forward(
+                    model_kwargs=model_kwargs,
+                    forward_mode=forward_mode,
                 )  # prevent model thinks we are generating
 
                 if self.use_fused_kernels:
@@ -414,16 +457,22 @@ class DataParallelPPOActor(BasePPOActor):
             else:
                 self.actor_optimizer.step()
 
-        # Clear cached weight scales for QAT (weights changed)
-        if getattr(self.actor_module, "_qat_fuse_enabled", False):
+        # Clear cached QAT weight-scale/amax states after optimizer.step().
+        if getattr(self.actor_module, "_qat_enabled", False) or getattr(
+            self.actor_module, "_qat_fuse_enabled", False
+        ):
             from verl.utils.qat import invalidate_all_scales
 
             invalidate_all_scales(self.actor_module)
+            self._qat_optimizer_step += 1
+            self._set_qat_observer_train_step(self._qat_optimizer_step)
 
         return grad_norm
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
-    def compute_log_prob(self, data: DataProto, calculate_entropy: bool = False) -> dict[str, torch.Tensor]:
+    def compute_log_prob(
+        self, data: DataProto, calculate_entropy: bool = False, forward_mode: str = "old_log_prob"
+    ) -> dict[str, torch.Tensor]:
         """Compute the log probability of the responses given input_ids, attention_mask and position_ids
 
         Args:
@@ -478,7 +527,10 @@ class DataParallelPPOActor(BasePPOActor):
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
             with torch.no_grad():
                 outputs = self._forward_micro_batch(
-                    model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
+                    model_inputs,
+                    temperature=temperature,
+                    calculate_entropy=calculate_entropy,
+                    forward_mode=forward_mode,
                 )
             log_probs_lst.append(outputs["log_probs"])
             if calculate_entropy:
@@ -507,24 +559,39 @@ class DataParallelPPOActor(BasePPOActor):
         return outputs
 
     @contextmanager
-    def _temporarily_disable_qat_fake_quant(self):
-        """Temporarily disable fake quant for BF16 teacher forward."""
+    def _temporarily_set_qat_fake_quant(self, enabled: bool):
+        """Temporarily set QAT fake-quant runtime mode for teacher forward."""
         try:
             from verl.utils.qat.linear import QATLinear
         except Exception:
             QATLinear = None
+        try:
+            from verl.utils.qat.fused_rms_norm_fake_quant import FusedRMSNormFakeQuant
+        except Exception:
+            FusedRMSNormFakeQuant = None
 
-        qat_modules_and_states: list[tuple[nn.Module, bool]] = []
-        if QATLinear is not None:
-            for module in self.actor_module.modules():
-                if isinstance(module, QATLinear) and hasattr(module, "fake_quant_enabled"):
-                    qat_modules_and_states.append((module, bool(module.fake_quant_enabled)))
-                    module.fake_quant_enabled = False
+        qat_modules_and_states: list[tuple[nn.Module, bool, bool]] = []
+        fused_norm_states: list[tuple[nn.Module, bool]] = []
+        for module in self.actor_module.modules():
+            if QATLinear is not None and isinstance(module, QATLinear) and hasattr(module, "fake_quant_enabled"):
+                old_fake_quant_enabled = bool(module.fake_quant_enabled)
+                old_observe_input_scale_only = bool(getattr(module, "observe_input_scale_only", False))
+                qat_modules_and_states.append((module, old_fake_quant_enabled, old_observe_input_scale_only))
+                module.fake_quant_enabled = bool(enabled)
+                if hasattr(module, "observe_input_scale_only"):
+                    module.observe_input_scale_only = bool((not enabled) and old_observe_input_scale_only)
+            elif FusedRMSNormFakeQuant is not None and isinstance(module, FusedRMSNormFakeQuant):
+                fused_norm_states.append((module, bool(module.fake_quant_enabled)))
+                module.fake_quant_enabled = bool(enabled)
         try:
             yield
         finally:
-            for module, old_state in qat_modules_and_states:
-                module.fake_quant_enabled = old_state
+            for module, old_fake_quant_enabled, old_observe_input_scale_only in qat_modules_and_states:
+                module.fake_quant_enabled = old_fake_quant_enabled
+                if hasattr(module, "observe_input_scale_only"):
+                    module.observe_input_scale_only = old_observe_input_scale_only
+            for module, old_fake_quant_enabled in fused_norm_states:
+                module.fake_quant_enabled = old_fake_quant_enabled
 
     @contextmanager
     def _temporarily_set_eval_mode(self):
@@ -538,15 +605,18 @@ class DataParallelPPOActor(BasePPOActor):
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def compute_teacher_log_prob(self, data: DataProto) -> dict[str, torch.Tensor]:
-        """Compute BF16 teacher log-probs with fake quant disabled."""
+        """Compute teacher log-probs for self-distill (BF16 or QAT teacher)."""
+        teacher_use_qat_forward = bool(self.config.get("self_distill_teacher_use_qat_forward", False))
         with self._temporarily_set_eval_mode():
-            with self._temporarily_disable_qat_fake_quant():
-                return self.compute_log_prob(data=data, calculate_entropy=False)
+            with self._temporarily_set_qat_fake_quant(enabled=teacher_use_qat_forward):
+                return self.compute_log_prob(data=data, calculate_entropy=False, forward_mode="teacher")
 
     @GPUMemoryLogger(role="dp actor", logger=logger)
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
         self.actor_module.train()
+        if getattr(self.actor_module, "_qat_enabled", False) or getattr(self.actor_module, "_qat_fuse_enabled", False):
+            self._set_qat_observer_train_step(self._qat_optimizer_step)
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         pad_token_id = data.meta_info.get("pad_token_id", 0)
@@ -597,7 +667,15 @@ class DataParallelPPOActor(BasePPOActor):
         self_distill_teacher_forward_mode = str(
             self.config.get("self_distill_teacher_forward_mode", "per_micro_batch")
         ).strip().lower()
-        self_distill_active = self_distill_enable and self_distill_coef > 0.0
+        self_distill_teacher_use_qat_forward = bool(self.config.get("self_distill_teacher_use_qat_forward", False))
+        self_distill_observe_only = bool(self.config.get("self_distill_observe_only", False))
+        self_distill_conflict_hard_gate_enable = bool(
+            self.config.get("self_distill_conflict_hard_gate_enable", False)
+        )
+        self_distill_conflict_track_without_hard_gate = bool(
+            self.config.get("self_distill_conflict_track_without_hard_gate", False)
+        )
+        self_distill_active = self_distill_enable and (self_distill_coef > 0.0 or self_distill_observe_only)
 
         if self_distill_loss_type not in {"abs_logprob", "mse", "low_var_kl"}:
             raise ValueError(
@@ -609,14 +687,12 @@ class DataParallelPPOActor(BasePPOActor):
                 "self_distill_teacher_forward_mode must be 'per_micro_batch' or 'per_train_batch', "
                 f"got {self_distill_teacher_forward_mode!r}."
             )
-
         metrics = {
             "actor/pg_loss": 0.0,
             "actor/kl_loss": 0.0,
         }
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
-                teacher_log_prob_train_batch = None
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
@@ -669,13 +745,56 @@ class DataParallelPPOActor(BasePPOActor):
                     # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
                     rollout_is_weights = model_inputs.get("rollout_is_weights", None)
                     rollout_acr_r = model_inputs.get("rollout_acr_r", None)
+                    rollout_log_prob = model_inputs.get("rollout_log_probs", None)
 
                     # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
                     # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
                     policy_loss_fn = get_policy_loss_fn(loss_mode)
+                    tbpo_seq_mismatch_weight = None
+                    tbpo_seq_keep_mask = None
+                    tbpo_metrics = {"actor/tbpo_active": 0.0}
+                    if loss_mode == "tbpo":
+                        from verl.trainer.ppo.rollout_corr_helper import compute_tbpo_sequence_stats
+
+                        if rollout_log_prob is None:
+                            raise RuntimeError(
+                                "TBPO loss requires rollout_log_probs in batch. "
+                                "Set actor_rollout_ref.rollout.calculate_log_probs=True."
+                            )
+                        rollout_corr_cfg = (
+                            self.config.policy_loss.get("rollout_correction", None)
+                            if hasattr(self.config, "policy_loss")
+                            else None
+                        )
+                        if rollout_corr_cfg is None:
+                            raise RuntimeError(
+                                "TBPO loss requires policy_loss.rollout_correction config to be present."
+                            )
+                        tbpo_cap = float(rollout_corr_cfg.get("tbpo_seq_tis_imp_ratio_cap", 2.0))
+                        tbpo_tensors, tbpo_stats = compute_tbpo_sequence_stats(
+                            old_log_prob=old_log_prob.detach(),
+                            rollout_log_prob=rollout_log_prob.detach(),
+                            response_mask=response_mask,
+                            current_log_prob=log_prob.detach(),
+                            seq_mismatch_cap=tbpo_cap,
+                        )
+                        tbpo_seq_mismatch_weight = tbpo_tensors["tbpo_seq_mismatch_weight_clipped"]
+                        tbpo_seq_keep_mask = tbpo_tensors.get("tbpo_seq_keep_mask_w", tbpo_tensors["tbpo_seq_keep_mask"])
+                        if rollout_is_weights is not None:
+                            tbpo_metrics["actor/tbpo_rollout_is_disabled"] = 1.0
+                            rollout_is_weights = None
+                        else:
+                            tbpo_metrics["actor/tbpo_rollout_is_disabled"] = 0.0
+                        if rollout_acr_r is not None:
+                            rollout_acr_r = None
+                            tbpo_metrics["actor/tbpo_acr_disabled"] = 1.0
+                        else:
+                            tbpo_metrics["actor/tbpo_acr_disabled"] = 0.0
+                        tbpo_metrics.update({f"actor/{k}": v for k, v in tbpo_stats.items()})
+                        tbpo_metrics["actor/tbpo_active"] = 1.0
 
                     # Compute policy loss (any function is expected to return 2 values)
-                    pg_loss, pg_metrics = policy_loss_fn(
+                    policy_loss_kw = dict(
                         old_log_prob=old_log_prob,
                         log_prob=log_prob,
                         advantages=advantages,
@@ -685,10 +804,14 @@ class DataParallelPPOActor(BasePPOActor):
                         rollout_is_weights=rollout_is_weights,
                         rollout_acr_r=rollout_acr_r,
                     )
+                    if loss_mode == "tbpo":
+                        policy_loss_kw["tbpo_seq_mismatch_weight"] = tbpo_seq_mismatch_weight
+                        policy_loss_kw["tbpo_seq_keep_mask"] = tbpo_seq_keep_mask
+                    pg_loss, pg_metrics = policy_loss_fn(**policy_loss_kw)
                     micro_batch_metrics.update(pg_metrics)
+                    micro_batch_metrics.update(tbpo_metrics)
 
                     # Skip if using bypass_mode loss (metrics already computed in pg_metrics)
-                    rollout_log_prob = model_inputs.get("rollout_log_probs", None)
                     if loss_mode != "bypass_mode" and rollout_log_prob is not None:
                         # Compute metrics using CURRENT policy π_θ vs π_rollout
                         # Tracks evolving off-policy gap as π_θ updates during mini-batch training
@@ -713,28 +836,24 @@ class DataParallelPPOActor(BasePPOActor):
                         precomputed_teacher_log_prob = model_inputs.get("old_bf16_log_probs", None)
                         if (
                             self_distill_teacher_forward_mode == "per_train_batch"
+                            and not self_distill_teacher_use_qat_forward
                             and precomputed_teacher_log_prob is not None
                             and tuple(precomputed_teacher_log_prob.shape) == tuple(log_prob.shape)
                         ):
                             teacher_log_prob = precomputed_teacher_log_prob.detach()
-                        elif (
-                            self_distill_teacher_forward_mode == "per_train_batch"
-                            and teacher_log_prob_train_batch is not None
-                            and tuple(teacher_log_prob_train_batch.shape) == tuple(log_prob.shape)
-                        ):
-                            teacher_log_prob = teacher_log_prob_train_batch
                         else:
                             with torch.no_grad():
                                 with self._temporarily_set_eval_mode():
-                                    with self._temporarily_disable_qat_fake_quant():
+                                    with self._temporarily_set_qat_fake_quant(
+                                        enabled=self_distill_teacher_use_qat_forward
+                                    ):
                                         teacher_outputs = self._forward_micro_batch(
                                             model_inputs,
                                             temperature=temperature,
                                             calculate_entropy=False,
+                                            forward_mode="teacher",
                                         )
                             teacher_log_prob = teacher_outputs["log_probs"].detach()
-                            if self_distill_teacher_forward_mode == "per_train_batch":
-                                teacher_log_prob_train_batch = teacher_log_prob
 
                         logprob_gap = log_prob - teacher_log_prob
                         if self_distill_loss_type == "abs_logprob":
@@ -748,14 +867,72 @@ class DataParallelPPOActor(BasePPOActor):
                             self_distill_token_obj = torch.square(logprob_gap)
 
                         token_weights = response_mask.to(dtype=log_prob.dtype)
+                        response_mask_bool = response_mask.to(dtype=torch.bool)
+                        if not self_distill_conflict_hard_gate_enable:
+                            micro_batch_metrics["actor/self_distill_conflict_hard_gate_enabled"] = 0.0
+                            if response_mask_bool.any():
+                                if self_distill_conflict_track_without_hard_gate:
+                                    sd_direction = torch.sign(
+                                        (teacher_log_prob.detach() - log_prob.detach()).to(torch.float32)
+                                    )
+                                    pg_direction = torch.sign(advantages.detach().to(torch.float32))
+                                    conflict_mask = ((sd_direction * pg_direction) < 0) & response_mask_bool
+                                    conflict_frac = float(conflict_mask[response_mask_bool].float().mean().item())
+                                    micro_batch_metrics["actor/self_distill_conflict_token_frac"] = conflict_frac
+                                    micro_batch_metrics["actor/self_distill_conflict_kept_weight_frac"] = conflict_frac
+                                else:
+                                    micro_batch_metrics["actor/self_distill_conflict_token_frac"] = 0.0
+                                    micro_batch_metrics["actor/self_distill_conflict_kept_weight_frac"] = 1.0
+                                scope_mask = response_mask_bool
+                                micro_batch_metrics["actor/self_distill_conflict_scope_token_frac"] = float(
+                                    scope_mask[response_mask_bool].float().mean().item()
+                                )
+                            else:
+                                micro_batch_metrics["actor/self_distill_conflict_scope_token_frac"] = 0.0
+                                micro_batch_metrics["actor/self_distill_conflict_token_frac"] = 0.0
+                                micro_batch_metrics["actor/self_distill_conflict_kept_weight_frac"] = 0.0
+                        else:
+                            micro_batch_metrics["actor/self_distill_conflict_hard_gate_enabled"] = 1.0
+                            if response_mask_bool.any():
+                                sd_direction = torch.sign((teacher_log_prob.detach() - log_prob.detach()).to(torch.float32))
+                                pg_direction = torch.sign(advantages.detach().to(torch.float32))
+                                scope_mask = response_mask_bool
+                                micro_batch_metrics["actor/self_distill_conflict_scope_token_frac"] = float(
+                                    scope_mask[response_mask_bool].float().mean().item()
+                                )
+                                conflict_mask = ((sd_direction * pg_direction) < 0) & scope_mask
+                                valid_conflict = conflict_mask[response_mask_bool]
+                                micro_batch_metrics["actor/self_distill_conflict_token_frac"] = float(
+                                    valid_conflict.float().mean().item()
+                                )
+                                weight_sum_pre = float(token_weights.detach()[response_mask_bool].sum().item())
+                                token_weights = token_weights * (~conflict_mask).to(token_weights.dtype)
+                                weight_sum_post = float(token_weights.detach()[response_mask_bool].sum().item())
+                                if weight_sum_pre > 0.0:
+                                    micro_batch_metrics["actor/self_distill_conflict_kept_weight_frac"] = (
+                                        weight_sum_post / weight_sum_pre
+                                    )
+                                else:
+                                    micro_batch_metrics["actor/self_distill_conflict_kept_weight_frac"] = 0.0
+                            else:
+                                micro_batch_metrics["actor/self_distill_conflict_scope_token_frac"] = 0.0
+                                micro_batch_metrics["actor/self_distill_conflict_token_frac"] = 0.0
+                                micro_batch_metrics["actor/self_distill_conflict_kept_weight_frac"] = 0.0
                         eps = torch.finfo(log_prob.dtype).eps
                         self_distill_loss = (self_distill_token_obj * token_weights).sum() / (token_weights.sum() + eps)
-                        policy_loss = policy_loss + self_distill_coef * self_distill_loss
+                        self_distill_applied_coef = 0.0 if self_distill_observe_only else self_distill_coef
+                        if self_distill_applied_coef != 0.0:
+                            policy_loss = policy_loss + self_distill_applied_coef * self_distill_loss
                         micro_batch_metrics["actor/self_distill_loss"] = self_distill_loss.detach().item()
                         micro_batch_metrics["actor/self_distill_logprob_gap_mean"] = (
                             (logprob_gap * token_weights).sum() / (token_weights.sum() + eps)
                         ).detach().item()
                         micro_batch_metrics["actor/self_distill_coef"] = self_distill_coef
+                        micro_batch_metrics["actor/self_distill_applied_coef"] = self_distill_applied_coef
+                        micro_batch_metrics["actor/self_distill_teacher_use_qat_forward"] = float(
+                            self_distill_teacher_use_qat_forward
+                        )
+                        micro_batch_metrics["actor/self_distill_observe_only"] = float(self_distill_observe_only)
 
                     if self.config.use_kl_loss:
                         ref_log_prob = model_inputs["ref_log_prob"]
@@ -778,6 +955,11 @@ class DataParallelPPOActor(BasePPOActor):
                         self.scaler.scale(loss).backward()
                     else:
                         loss.backward()
+
+                    if getattr(self.actor_module, "_qat_batched_amax_sync", False):
+                        from verl.utils.qat import sync_activation_observer_amax
+
+                        sync_activation_observer_amax(self.actor_module)
 
                     metrics["actor/pg_loss"] += pg_loss.detach().item() * loss_scale_factor
                     append_to_dict(metrics, micro_batch_metrics)

@@ -39,6 +39,35 @@ from verl.utils.ulysses import (
 logger = logging.get_logger(__name__)
 
 
+def _is_w4a4_shared_qat_linear(module) -> bool:
+    return (
+        callable(getattr(module, "quantize_activation_once", None))
+        and callable(getattr(module, "forward_with_prequantized_input", None))
+        and getattr(module, "mode", None) == "w4a4"
+        and bool(getattr(module, "fake_quant_enabled", False))
+    )
+
+
+def _project_qkv_with_optional_shared_activation(attn_module, hidden_states: torch.Tensor):
+    q_proj = attn_module.q_proj
+    k_proj = attn_module.k_proj
+    v_proj = attn_module.v_proj
+    can_share = _is_w4a4_shared_qat_linear(q_proj) and _is_w4a4_shared_qat_linear(k_proj) and _is_w4a4_shared_qat_linear(
+        v_proj
+    )
+    if not can_share:
+        return q_proj(hidden_states), k_proj(hidden_states), v_proj(hidden_states)
+
+    shared_x_fq = q_proj.quantize_activation_once(hidden_states)
+    k_proj.sync_observer_from(q_proj)
+    v_proj.sync_observer_from(q_proj)
+    return (
+        q_proj.forward_with_prequantized_input(shared_x_fq),
+        k_proj.forward_with_prequantized_input(shared_x_fq),
+        v_proj.forward_with_prequantized_input(shared_x_fq),
+    )
+
+
 def llama_flash_attn_forward(
     self,
     hidden_states: torch.Tensor,
@@ -60,9 +89,7 @@ def llama_flash_attn_forward(
 
     bsz, q_len, _ = hidden_states.size()
 
-    query_states = self.q_proj(hidden_states)
-    key_states = self.k_proj(hidden_states)
-    value_states = self.v_proj(hidden_states)
+    query_states, key_states, value_states = _project_qkv_with_optional_shared_activation(self, hidden_states)
 
     # Flash attention requires the input to have the shape
     # batch_size x seq_length x head_dim x hidden_dim
@@ -186,9 +213,10 @@ def llama_attn_forward(
 
     bsz, q_len, _ = hidden_states.shape
 
-    query_states = self.q_proj(hidden_states).view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
-    key_states = self.k_proj(hidden_states).view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
-    value_states = self.v_proj(hidden_states).view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+    query_states, key_states, value_states = _project_qkv_with_optional_shared_activation(self, hidden_states)
+    query_states = query_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+    key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+    value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
 
     ########## AlltoAll for Ulysses ##########
     ulysses_sp_size = get_ulysses_sequence_parallel_world_size()

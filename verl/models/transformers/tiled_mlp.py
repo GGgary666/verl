@@ -158,7 +158,25 @@ class TiledMLP(torch.autograd.Function):
 
 def _mlp_forward_fn(module, x):
     """Forward function for LlamaMLP / Qwen2MLP / Qwen3MLP style."""
-    return module.down_proj(module.act_fn(module.gate_proj(x)) * module.up_proj(x))
+    gate_proj = module.gate_proj
+    up_proj = module.up_proj
+    can_share = (
+        callable(getattr(gate_proj, "quantize_activation_once", None))
+        and callable(getattr(gate_proj, "forward_with_prequantized_input", None))
+        and callable(getattr(up_proj, "forward_with_prequantized_input", None))
+        and getattr(gate_proj, "mode", None) == "w4a4"
+        and getattr(up_proj, "mode", None) == "w4a4"
+        and bool(getattr(gate_proj, "fake_quant_enabled", False))
+        and bool(getattr(up_proj, "fake_quant_enabled", False))
+    )
+    if not can_share:
+        return module.down_proj(module.act_fn(gate_proj(x)) * up_proj(x))
+
+    shared_x_fq = gate_proj.quantize_activation_once(x)
+    up_proj.sync_observer_from(gate_proj)
+    gate = gate_proj.forward_with_prequantized_input(shared_x_fq)
+    up = up_proj.forward_with_prequantized_input(shared_x_fq)
+    return module.down_proj(module.act_fn(gate) * up)
 
 
 # ============================================================================

@@ -311,6 +311,20 @@ def patched_w4a16_process_weights_after_loading(self, layer: torch.nn.Module) ->
     weight_global_scale_hf = layer.weight_global_scale.data
     weight_scale_hf = layer.weight_scale.data
 
+    # Log diagnostics on first weight sync (second call) to catch corruption early.
+    _layer_total_calls = getattr(layer, "_process_weights_call_count", 1)
+    if _layer_total_calls == 2:
+        _gs = weight_global_scale_hf.float()
+        _ws_fp32 = weight_scale_hf.float()
+        logger.warning(
+            "[QAT][W4A16] weight sync diag: params_dtype=%s, "
+            "global_scale=%.6g, weight_scale min/max=%.6g/%.6g, "
+            "packed_shape=%s, packed_dtype=%s",
+            param_dtype, _gs.max().item(),
+            _ws_fp32.min().item(), _ws_fp32.max().item(),
+            tuple(weight_packed_hf.shape), weight_packed_hf.dtype,
+        )
+
     # Create workspace (first call only)
     if is_first_call:
         layer.workspace = marlin_make_workspace_new(device)
@@ -337,7 +351,15 @@ def patched_w4a16_process_weights_after_loading(self, layer: torch.nn.Module) ->
     )
     marlin_weight_scale = nvfp4_marlin_process_scales(weight_scale_permuted)
 
-    weight_scale_2_raw = (1.0 / weight_global_scale_hf.max()).to(param_dtype)
+    global_scale_val = weight_global_scale_hf.max()
+    if not is_first_call:
+        if global_scale_val.item() <= 0 or not torch.isfinite(global_scale_val):
+            raise RuntimeError(
+                f"[QAT][W4A16] Invalid weight_global_scale={global_scale_val.item()} after "
+                f"weight sync (is_first_call={is_first_call}). The quantizer likely produced "
+                f"corrupted scales. Check that actor.qat.mode matches the quantization_config."
+            )
+    weight_scale_2_raw = (1.0 / global_scale_val).to(param_dtype)
     marlin_weight_scale_2 = nvfp4_marlin_process_global_scale(weight_scale_2_raw)
 
     # Update compute parameters
@@ -391,6 +413,31 @@ def patched_w4a4_process_weights_after_loading(self, layer: torch.nn.Module) -> 
 
     global_input_scale = input_global_scale_data.max().to(torch.float32)
     global_weight_scale = weight_global_scale_data.max().to(torch.float32)
+
+    # Detect uninitialized / corrupted input_global_scale.  This typically means
+    # the training-side QATQuantizer runs in W4A16 mode (no input_global_scale)
+    # but vLLM loaded the model with a W4A4 scheme — the rebuilt parameter
+    # contains torch.empty() garbage.  Fail fast so the user gets a clear error
+    # instead of silently broken inference (inf/nan alpha → garbage logits →
+    # very short rollout outputs with all-negative rewards).
+    if not is_first_call:
+        if (
+            global_input_scale.item() <= 0
+            or not torch.isfinite(global_input_scale)
+            or global_weight_scale.item() <= 0
+            or not torch.isfinite(global_weight_scale)
+        ):
+            raise RuntimeError(
+                f"[QAT][W4A4] Invalid scales after weight sync: "
+                f"input_global_scale={global_input_scale.item()}, "
+                f"weight_global_scale={global_weight_scale.item()}.  "
+                f"This usually means the training-side QATQuantizer uses mode='w4a16' "
+                f"(which does not emit input_global_scale) but vLLM loaded the model "
+                f"with a W4A4 quantization scheme (which expects it).  "
+                f"Check that actor.qat.mode and actor.qat.quantization_config_path are "
+                f"consistent, and that the model checkpoint's embedded quantization_config "
+                f"is not overriding the hf_overrides."
+            )
 
     if self.backend == "flashinfer-trtllm":
         from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
@@ -798,6 +845,7 @@ def manual_process_weights_after_loading(model):
     """Trigger weight post-processing for all quantized layers after load_weights."""
     dense_count = 0
     moe_count = 0
+    scheme_names: set[str] = set()
 
     actual_model = model
     if hasattr(model, "model"):
@@ -805,7 +853,9 @@ def manual_process_weights_after_loading(model):
 
     for module in actual_model.modules():
         if hasattr(module, "scheme"):
-            module.scheme.process_weights_after_loading(module)
+            scheme = module.scheme
+            scheme.process_weights_after_loading(module)
+            scheme_names.add(type(scheme).__name__)
             dense_count += 1
 
         quant_method = getattr(module, "quant_method", None)
@@ -817,7 +867,25 @@ def manual_process_weights_after_loading(model):
                 quant_method.process_weights_after_loading(module)
                 moe_count += 1
 
-    logger.debug(f"Processed {dense_count} dense layers, {moe_count} MoE layers")
+    # Log the actual scheme(s) detected — critical for diagnosing mode mismatches
+    # (e.g. mode=w4a16 but vLLM loaded with W4A4 scheme from embedded quant config).
+    if scheme_names:
+        logger.warning(
+            "[QAT] process_weights_after_loading: dense=%d, moe=%d, schemes=%s",
+            dense_count, moe_count, scheme_names,
+        )
+        # Cross-check: if both W4A16 and W4A4 schemes appear, something is wrong.
+        _w4a16_schemes = {s for s in scheme_names if "W4A16" in s}
+        _w4a4_schemes = {s for s in scheme_names if "W4A4" in s and "W4A16" not in s}
+        if _w4a16_schemes and _w4a4_schemes:
+            logger.error(
+                "[QAT] MIXED schemes detected: W4A16=%s, W4A4=%s. "
+                "This will cause corrupted inference. Check that "
+                "actor.qat.quantization_config_path matches actor.qat.mode.",
+                _w4a16_schemes, _w4a4_schemes,
+            )
+    else:
+        logger.debug(f"Processed {dense_count} dense layers, {moe_count} MoE layers")
     return dense_count + moe_count
 
 

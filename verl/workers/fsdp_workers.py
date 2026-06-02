@@ -84,7 +84,13 @@ from verl.utils.profiler.performance import reduce_timing, topk_reduce_ratio_min
 from verl.utils.py_functional import convert_to_regular_types
 
 # QAT support
-from verl.utils.qat import apply_qat, enable_qat_fuse
+from verl.utils.qat import (
+    apply_qat,
+    enable_batched_amax_sync,
+    enable_qat_fuse,
+    reset_activation_observer_update_dedup,
+    set_qat_runtime_mode,
+)
 from verl.utils.ray_utils import get_event_loop
 from verl.workers.config import FSDPCriticConfig, FSDPEngineConfig, HFModelConfig, RolloutConfig
 from verl.workers.config.optimizer import build_optimizer
@@ -95,6 +101,34 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 device_name = get_device_name()
+
+
+def _dtensor_to_full_tensor(param, device=None):
+    """Convert DTensor to full tensor. Fallback for NCCL without coalesced all-gather."""
+    if not isinstance(param, DTensor):
+        return param
+    if device is not None:
+        param = param.to(device, non_blocking=True)
+    try:
+        return param.full_tensor()
+    except RuntimeError as e:
+        if "allgather_into_tensor_coalesced" not in str(e):
+            raise
+        # Fallback: use all_gather when coalesced all-gather is unavailable.
+        local = param.to_local()
+        world_size = torch.distributed.get_world_size()
+        tensor_list = [torch.empty_like(local) for _ in range(world_size)]
+        torch.distributed.all_gather(tensor_list, local)
+        shard_dim = 0
+        try:
+            from torch.distributed.tensor.placement_types import Shard
+        except ImportError:
+            from torch.distributed._tensor.placement_types import Shard
+        for p in param.placements:
+            if isinstance(p, Shard):
+                shard_dim = p.dim
+                break
+        return torch.cat(tensor_list, dim=shard_dim)
 
 
 def create_device_mesh(world_size, fsdp_size):
@@ -327,12 +361,37 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self._w4a4_scales_restored = loaded_count > 0
 
     def _calibrate_w4a4_input_scales(self):
-        """Run a forward pass to initialize input_global_scale for W4A4 when not loaded from checkpoint."""
+        """Run a forward pass to initialize input_global_scale for W4A4 when not loaded from checkpoint.
+
+        Works with pure BF16 models (no pre-calibrated scales) by switching to
+        observe-only mode: fake quantization is disabled while activation
+        observers still update, initialising ``input_global_scale`` from the
+        dummy forward pass without hitting the "uninitialized scale" guard.
+        """
         if not self._qat_enabled or self.qat_config.mode != "w4a4":
             return
         if getattr(self, "_w4a4_scales_restored", False) or getattr(self, "_w4a4_calibrated", False):
             return
 
+        # --- 1. Switch to observe-only mode (no fake-quant, observers still run) ---
+        # This avoids RuntimeError from FusedRMSNormFakeQuant / QATLinear when
+        # input_global_scale is not yet initialised (pure BF16 model).
+        set_qat_runtime_mode(
+            self.actor_module_fsdp,
+            fake_quant_enabled=False,
+            observe_input_scale_only=True,
+        )
+
+        # Temporarily disable batched amax sync so observers update
+        # input_global_scale immediately (instead of deferring to a later
+        # sync_activation_observer_amax call that won't happen here).
+        batched_modules = []
+        for module in self.actor_module_fsdp.modules():
+            if getattr(module, "_use_batched_amax_sync", False):
+                module._use_batched_amax_sync = False
+                batched_modules.append(module)
+
+        # --- 2. Run calibration forward ---
         config = self.actor_model_config
         vocab_size = getattr(config, "vocab_size", None) or getattr(
             getattr(config, "text_config", None), "vocab_size", 32000
@@ -359,6 +418,32 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                         "Ensure checkpoint has input_global_scale or use W4A16."
                     )
                 raise
+
+        # --- 3. Restore batched amax sync ---
+        for module in batched_modules:
+            module._use_batched_amax_sync = True
+
+        # --- 4. Restore original runtime mode ---
+        train_fake_quant_enable = bool(getattr(self.qat_config, "train_fake_quant_enable", True))
+        observe_w4a4 = bool(getattr(self.qat_config, "observe_w4a4_input_scale_in_bf16_forward", True))
+        set_qat_runtime_mode(
+            self.actor_module_fsdp,
+            fake_quant_enabled=train_fake_quant_enable,
+            observe_input_scale_only=observe_w4a4,
+        )
+
+        # --- 5. Sync FusedRMSNorm ↔ projection scales if applicable ---
+        # With fuse_w4a4_rms_norm_activation, FusedRMSNormFakeQuant modules now
+        # have their own observer-initialised scales.  Copy them to the
+        # skip_input_activation_fake_quant projections (q/k/v, gate/up) so that
+        # the weight-sync path (which reads QATLinear.input_global_scale) also
+        # has valid values.
+        if getattr(self.qat_config, "fuse_w4a4_rms_norm_activation", False):
+            from verl.utils.qat.fused_rms_norm_fake_quant import sync_projection_buffers_from_fused_norms
+
+            sync_projection_buffers_from_fused_norms(self.actor_module_fsdp)
+
+        reset_activation_observer_update_dedup(self.actor_module_fsdp)
 
         self._w4a4_calibrated = True
         if self.rank == 0:
@@ -578,8 +663,22 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         if role == "actor" and self._qat_enabled:
             actor_module = apply_qat(actor_module, self.qat_config)
             enable_qat_fuse(actor_module)
+            train_fake_quant_enable = bool(getattr(self.qat_config, "train_fake_quant_enable", True))
+            observe_w4a4_input_scale_in_bf16_forward = bool(
+                getattr(self.qat_config, "observe_w4a4_input_scale_in_bf16_forward", True)
+            )
+            set_qat_runtime_mode(
+                actor_module,
+                fake_quant_enabled=train_fake_quant_enable,
+                observe_input_scale_only=observe_w4a4_input_scale_in_bf16_forward,
+            )
             if self.qat_config.mode == "w4a4":
                 self._restore_w4a4_input_scales(actor_module, self.config.model.path)
+                if getattr(self.qat_config, "fuse_w4a4_rms_norm_activation", False):
+                    from verl.utils.qat.fused_rms_norm_fake_quant import sync_fused_norm_buffers_from_projections
+
+                    sync_fused_norm_buffers_from_projections(actor_module)
+                enable_batched_amax_sync(actor_module)
 
         torch.distributed.barrier()
 
@@ -838,7 +937,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         else:
             device = get_device_id()  # used when fsdp2 set cpu_offload_policy
             per_tensor_param = (
-                (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
+                (name, _dtensor_to_full_tensor(param, device) if isinstance(param, DTensor) else param)
                 for name, param in params.items()
             )
 
@@ -853,9 +952,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 device=torch.device(get_device_id()),
                 param_dtype=self._param_dtype,
             )
+            # IPC mode prefers GPU tensors (device-to-device copy to GPU buckets),
+            # while SHM mode prefers CPU tensors (avoid extra device-to-host copies).
+            quant_output_device = (
+                torch.device("cpu")
+                if bool(getattr(self.rollout, "use_shm", True))
+                else torch.device(get_device_id())
+            )
             per_tensor_param = quantizer.quantize_with_fusion(
                 per_tensor_param,
-                target_device=torch.device("cpu"),
+                target_device=quant_output_device,
             )
             aggressive_empty_cache(force_sync=True)
 
@@ -869,7 +975,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             and self.config.rollout.free_cache_engine
         ):
             per_tensor_base_params = (
-                (name, param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param)
+                (name, _dtensor_to_full_tensor(param, device) if isinstance(param, DTensor) else param)
                 for name, param in base_model_params.items()
             )
             await self.rollout.update_weights(per_tensor_base_params, base_sync_done=False)
@@ -1030,6 +1136,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update")
     def update_actor(self, data: DataProto):
         assert self._is_actor
+        # Release log_prob / compile peak before loading weights+optimizer for backward.
+        aggressive_empty_cache(force_sync=True)
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
         if self._is_offload_optimizer:
@@ -1144,7 +1252,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         data.meta_info["temperature"] = self.config.rollout.temperature
         data.meta_info.setdefault("pad_token_id", self.tokenizer.pad_token_id)
         # perform recompute log_prob
-        calculate_entropy = not is_lora
+        # Match megatron_actor: skip entropy softmax when entropy_coeff=0 unless calculate_entropy=True.
+        calculate_entropy = not is_lora and (
+            float(getattr(self.config.actor, "entropy_coeff", 0)) != 0.0
+            or bool(getattr(self.config.actor, "calculate_entropy", False))
+        )
         with self.ulysses_sharding_manager:
             with adapter_ctx:
                 outputs = self.actor.compute_log_prob(data=data, calculate_entropy=calculate_entropy)
@@ -1177,7 +1289,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="blue", role="actor_compute_teacher_log_prob")
     def compute_teacher_log_prob(self, data: DataProto):
-        """Compute BF16 teacher log-probs with fake quant disabled in actor."""
+        """Compute teacher log-probs for self-distill (BF16 or QAT teacher)."""
         assert self._is_actor
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
