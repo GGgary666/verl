@@ -25,7 +25,6 @@ import re
 from typing import Generator, Iterable, Optional
 
 import torch
-from compressed_tensors.compressors.quantized_compressors.fp4_quantized import NVFP4PackedCompressor
 from compressed_tensors.quantization.quant_args import (
     FP4_E2M1_DATA,
     FP8_E4M3_DATA,
@@ -36,6 +35,7 @@ from compressed_tensors.quantization.quant_args import (
 from compressed_tensors.quantization.utils.helpers import generate_gparam
 
 from verl.utils.device import get_device_name, get_torch_device
+from verl.utils.qat.compressed_tensors_compat import create_nvfp4_weight_packer
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -136,7 +136,7 @@ class QATQuantizer:
         self.device = device or torch.device(get_device_name())
         self.param_dtype = param_dtype
 
-        self._compressor = NVFP4PackedCompressor()
+        self._compressor = create_nvfp4_weight_packer()
         self._quant_args = QuantizationArgs(
             num_bits=4,
             type=QuantizationType.FLOAT,
@@ -145,6 +145,20 @@ class QATQuantizer:
             group_size=group_size,
             scale_dtype=FP8_E4M3_DATA.dtype,
         )
+
+    def _module_name(self, name: str) -> str:
+        if name.endswith(".weight"):
+            return name.rsplit(".weight", 1)[0]
+        return name
+
+    def _matches_ignore_pattern(self, module_name: str) -> bool:
+        for pattern in self.ignore_patterns:
+            if pattern.startswith("re:"):
+                if re.match(pattern[3:], module_name):
+                    return True
+            elif pattern in module_name:
+                return True
+        return False
 
     def _should_quantize(self, name: str, tensor: torch.Tensor) -> bool:
         """Check if parameter should be quantized."""
@@ -155,18 +169,19 @@ class QATQuantizer:
         if tensor.shape[1] % self.group_size != 0:
             return False
 
-        module_name = name.rsplit(".weight", 1)[0]
+        return not self._matches_ignore_pattern(self._module_name(name))
 
-        for pattern in self.ignore_patterns:
-            if pattern.startswith("re:"):
-                # Regex pattern - use re.match like vLLM does
-                regex = pattern[3:]
-                if re.match(regex, module_name):
-                    return False
-            else:
-                if pattern in module_name:
-                    return False
-        return True
+    def _should_sync_to_vllm(self, name: str) -> bool:
+        """Whether a non-quantized weight should still be synced to vLLM.
+
+        Vision tower weights are skipped: vLLM uses a different internal layout than
+        HF state_dict (e.g. pos_embed / attn.qkv shapes). Keep the initial vLLM
+        checkpoint weights for text-only RL workloads.
+        """
+        module_name = self._module_name(name)
+        if not self._matches_ignore_pattern(module_name):
+            return True
+        return "visual" not in module_name
 
     @staticmethod
     def _extract_layer_idx(name: str) -> Optional[int]:
@@ -192,7 +207,7 @@ class QATQuantizer:
             if self._should_quantize(name, tensor):
                 layer_name = name.rsplit(".weight", 1)[0]
                 layer_weights[layer_name] = (name, tensor)
-            else:
+            elif self._should_sync_to_vllm(name):
                 layer_passthrough[name] = tensor
 
         if layer_idx is None and layer_weights:

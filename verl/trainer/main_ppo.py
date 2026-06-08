@@ -266,11 +266,17 @@ class TaskRunner:
 
         # Instantiate the tokenizer and processor.
         from verl.utils import hf_processor, hf_tokenizer
+        from verl.utils.tokenizer import setup_chat_template
 
         trust_remote_code = config.data.get("trust_remote_code", False)
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
         # Used for multimodal LLM, could be None
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
+        setup_chat_template(
+            tokenizer,
+            processor,
+            custom_chat_template=config.actor_rollout_ref.model.get("custom_chat_template", None),
+        )
 
         resource_pool_manager = self.init_resource_pool_mgr(config)
 

@@ -19,6 +19,7 @@ import warnings
 __all__ = [
     "hf_tokenizer",
     "hf_processor",
+    "setup_chat_template",
     "normalize_token_ids",
     "build_multimodal_processor_inputs",
     "get_processor_token_id",
@@ -242,3 +243,24 @@ def hf_processor(name_or_path, **kwargs):
         processor = None
 
     return processor
+
+
+def setup_chat_template(tokenizer, processor=None, custom_chat_template=None):
+    """Sync and optionally override chat template on tokenizer/processor.
+
+    For base/multimodal models (e.g. Qwen3.5-0.8B-Base), the processor may not
+    have a chat_template while the tokenizer does. Sync it so that
+    processor.apply_chat_template() works during dataset filtering.
+    """
+    if (
+        processor is not None
+        and not getattr(processor, "chat_template", None)
+        and getattr(tokenizer, "chat_template", None)
+    ):
+        processor.chat_template = tokenizer.chat_template
+
+    if custom_chat_template is not None:
+        if processor is not None:
+            processor.chat_template = custom_chat_template
+        else:
+            tokenizer.chat_template = custom_chat_template

@@ -20,8 +20,17 @@ Enables dynamic weight reloading for NVFP4 quantized models in vLLM.
 Supported schemes:
 - Dense: W4A16-FP4, W4A4-FP4
 - MoE: NVFP4-MoE
+
+vLLM compatibility is resolved at runtime via API inspection (no hard-coded
+version checks):
+- <=0.18: nvfp4_marlin_process_scales returns a tensor; global scale uses
+  weight_scale_2 and half/bfloat16 inputs.
+- >=0.19: nvfp4_marlin_process_scales returns (tensor, scale_factor); global
+  scale uses weight_global_scale and float32 inputs with a_dtype.
+- >=0.20: MoE classes move under compressed_tensors_moe.* submodules.
 """
 
+import importlib
 import logging
 import os
 from typing import Optional
@@ -275,6 +284,54 @@ def _check_first_call(layer: torch.nn.Module) -> bool:
     return count == 0
 
 
+def _split_marlin_scale(value):
+    """Unpack nvfp4_marlin_process_scales output (tensor or (tensor, scale_factor))."""
+    return value if isinstance(value, tuple) else (value, 1.0)
+
+
+def _nvfp4_marlin_supports_a_dtype(func) -> bool:
+    import inspect
+
+    return "a_dtype" in inspect.signature(func).parameters
+
+
+def _w4a16_global_scale_param_name() -> str:
+    import inspect
+
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import apply_fp4_marlin_linear
+
+    if "weight_global_scale" in inspect.signature(apply_fp4_marlin_linear).parameters:
+        return "weight_global_scale"
+    return "weight_scale_2"
+
+
+def _call_nvfp4_marlin_process_scales(scales, param_dtype):
+    """Call nvfp4_marlin_process_scales across vLLM <=0.18 and >=0.19 APIs."""
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import nvfp4_marlin_process_scales
+
+    if _nvfp4_marlin_supports_a_dtype(nvfp4_marlin_process_scales):
+        raw = nvfp4_marlin_process_scales(scales, a_dtype=param_dtype)
+    else:
+        raw = nvfp4_marlin_process_scales(scales)
+    return _split_marlin_scale(raw)
+
+
+def _call_nvfp4_marlin_process_global_scale(inverted_global_scale, param_dtype, scale_factor=1.0):
+    """Process inverted global scale (1/max) into Marlin format across vLLM versions."""
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import nvfp4_marlin_process_global_scale
+
+    if _nvfp4_marlin_supports_a_dtype(nvfp4_marlin_process_global_scale):
+        value = (
+            inverted_global_scale
+            if inverted_global_scale.dtype == torch.float32
+            else inverted_global_scale.to(torch.float32)
+        )
+        processed = nvfp4_marlin_process_global_scale(value, a_dtype=param_dtype)
+    else:
+        processed = nvfp4_marlin_process_global_scale(inverted_global_scale.to(param_dtype))
+    return processed / scale_factor
+
+
 # Dense W4A16 Patches
 def patched_w4a16_process_weights_after_loading(self, layer: torch.nn.Module) -> None:
     """Patched process_weights_after_loading for W4A16 Dense layer."""
@@ -282,8 +339,6 @@ def patched_w4a16_process_weights_after_loading(self, layer: torch.nn.Module) ->
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
         marlin_make_workspace_new,
         marlin_permute_scales,
-        nvfp4_marlin_process_global_scale,
-        nvfp4_marlin_process_scales,
     )
 
     is_first_call = _check_first_call(layer)
@@ -335,22 +390,27 @@ def patched_w4a16_process_weights_after_loading(self, layer: torch.nn.Module) ->
         group_size=group_size,
         is_a_8bit=False,
     )
-    marlin_weight_scale = nvfp4_marlin_process_scales(weight_scale_permuted)
+    marlin_weight_scale, scale_factor = _call_nvfp4_marlin_process_scales(weight_scale_permuted, param_dtype)
+    marlin_weight_global_scale = _call_nvfp4_marlin_process_global_scale(
+        1.0 / weight_global_scale_hf.max(),
+        param_dtype,
+        scale_factor=scale_factor,
+    )
 
-    weight_scale_2_raw = (1.0 / weight_global_scale_hf.max()).to(param_dtype)
-    marlin_weight_scale_2 = nvfp4_marlin_process_global_scale(weight_scale_2_raw)
+    global_scale_attr = _w4a16_global_scale_param_name()
 
     # Update compute parameters
     if is_first_call:
         layer.weight = Parameter(marlin_weight, requires_grad=False)
         layer.weight_scale = Parameter(marlin_weight_scale, requires_grad=False)
-        layer.weight_scale_2 = Parameter(marlin_weight_scale_2, requires_grad=False)
+        setattr(layer, global_scale_attr, Parameter(marlin_weight_global_scale, requires_grad=False))
         if not hasattr(layer, "_marlin_tensor_refs"):
             layer._marlin_tensor_refs = {}
         layer._marlin_tensor_refs["weight_scale"] = layer.weight_scale.data
+        layer._marlin_tensor_refs[global_scale_attr] = getattr(layer, global_scale_attr).data
     else:
         layer.weight.data.copy_(marlin_weight)
-        layer.weight_scale_2.data.copy_(marlin_weight_scale_2)
+        getattr(layer, global_scale_attr).data.copy_(marlin_weight_global_scale)
         marlin_scale_ref = layer._marlin_tensor_refs.get("weight_scale")
         if marlin_scale_ref is not None:
             marlin_scale_ref.copy_(marlin_weight_scale)
@@ -362,7 +422,7 @@ def patched_w4a16_process_weights_after_loading(self, layer: torch.nn.Module) ->
     # Delete HF parameters
     if hasattr(layer, "weight_packed"):
         delattr(layer, "weight_packed")
-    if hasattr(layer, "weight_global_scale"):
+    if global_scale_attr == "weight_scale_2" and hasattr(layer, "weight_global_scale"):
         delattr(layer, "weight_global_scale")
 
 
@@ -473,10 +533,7 @@ def _marlin_repack_experts(packed, perm, size_k, size_n, num_experts):
 
 def _marlin_process_scales_experts(scale_hf, param_dtype, size_k, size_n, group_size, num_experts):
     """Process scales for each expert into Marlin format and stack."""
-    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
-        marlin_permute_scales,
-        nvfp4_marlin_process_scales,
-    )
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import marlin_permute_scales
 
     result = []
     scales = scale_hf.to(param_dtype)
@@ -488,17 +545,15 @@ def _marlin_process_scales_experts(scale_hf, param_dtype, size_k, size_n, group_
             group_size=group_size,
             is_a_8bit=False,
         )
-        result.append(nvfp4_marlin_process_scales(s))
+        processed_scale, _ = _call_nvfp4_marlin_process_scales(s, param_dtype)
+        result.append(processed_scale)
     return torch.stack(result)
 
 
 def _process_nvfp4_moe_marlin(self, layer: torch.nn.Module, is_first_call: bool) -> None:
     """Process MoE layer with MARLIN backend (W4A16)."""
     from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import make_nvfp4_moe_kernel
-    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
-        marlin_make_workspace_new,
-        nvfp4_marlin_process_global_scale,
-    )
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import marlin_make_workspace_new
 
     group_size = 16
     e = layer.num_experts
@@ -533,8 +588,8 @@ def _process_nvfp4_moe_marlin(self, layer: torch.nn.Module, is_first_call: bool)
     # Process global scales
     w13_scale_2 = 1.0 / layer.w13_weight_global_scale[:, 0]
     w2_scale_2 = 1.0 / layer.w2_weight_global_scale.data
-    w13_scale_2_processed = nvfp4_marlin_process_global_scale(w13_scale_2.to(param_dtype))
-    w2_scale_2_processed = nvfp4_marlin_process_global_scale(w2_scale_2.to(param_dtype))
+    w13_scale_2_processed = _call_nvfp4_marlin_process_global_scale(w13_scale_2, param_dtype)
+    w2_scale_2_processed = _call_nvfp4_marlin_process_global_scale(w2_scale_2, param_dtype)
 
     # Update parameters
     if is_first_call:
@@ -710,26 +765,43 @@ def patched_nvfp4_moe_process_weights_after_loading(self, layer: torch.nn.Module
         delattr(layer, "w2_weight_packed")
 
 
-_PATCH_TARGETS = [
-    # Dense W4A16
-    (
-        "vllm.model_executor.layers.quantization.compressed_tensors.schemes."
-        "compressed_tensors_w4a16_nvfp4.CompressedTensorsW4A16Fp4.process_weights_after_loading",
-        patched_w4a16_process_weights_after_loading,
-    ),
-    # Dense W4A4
-    (
-        "vllm.model_executor.layers.quantization.compressed_tensors.schemes."
-        "compressed_tensors_w4a4_nvfp4.CompressedTensorsW4A4Fp4.process_weights_after_loading",
-        patched_w4a4_process_weights_after_loading,
-    ),
-    # MoE NVFP4
-    (
-        "vllm.model_executor.layers.quantization.compressed_tensors."
-        "compressed_tensors_moe.CompressedTensorsW4A4Nvfp4MoEMethod.process_weights_after_loading",
-        patched_nvfp4_moe_process_weights_after_loading,
-    ),
-]
+_MOE_PKG = (
+    "vllm.model_executor.layers.quantization.compressed_tensors."
+    "compressed_tensors_moe"
+)
+
+
+def _resolve_moe_nvfp4_patch_target() -> str:
+    """Resolve MoE NVFP4 patch target across vLLM <=0.19 and >=0.20 layouts."""
+    moe_mod = importlib.import_module(_MOE_PKG)
+    if hasattr(moe_mod, "CompressedTensorsW4A4Nvfp4MoEMethod"):
+        cls = moe_mod.CompressedTensorsW4A4Nvfp4MoEMethod
+    else:
+        nvfp4_mod = importlib.import_module(f"{_MOE_PKG}.compressed_tensors_moe_w4a4_nvfp4")
+        cls = nvfp4_mod.CompressedTensorsW4A4Nvfp4MoEMethod
+    return f"{cls.__module__}.{cls.__qualname__}.process_weights_after_loading"
+
+
+def _build_patch_targets():
+    return [
+        # Dense W4A16
+        (
+            "vllm.model_executor.layers.quantization.compressed_tensors.schemes."
+            "compressed_tensors_w4a16_nvfp4.CompressedTensorsW4A16Fp4.process_weights_after_loading",
+            patched_w4a16_process_weights_after_loading,
+        ),
+        # Dense W4A4
+        (
+            "vllm.model_executor.layers.quantization.compressed_tensors.schemes."
+            "compressed_tensors_w4a4_nvfp4.CompressedTensorsW4A4Fp4.process_weights_after_loading",
+            patched_w4a4_process_weights_after_loading,
+        ),
+        # MoE NVFP4 (module path differs between vLLM <=0.19 and >=0.20)
+        (
+            _resolve_moe_nvfp4_patch_target(),
+            patched_nvfp4_moe_process_weights_after_loading,
+        ),
+    ]
 
 _applied_patches = []
 
@@ -744,7 +816,7 @@ def apply_qat_patches():
 
     logger.info("Applying NVFP4 patches for dynamic weight loading...")
 
-    for target, replacement in _PATCH_TARGETS:
+    for target, replacement in _build_patch_targets():
         p = patch(target, replacement)
         _applied_patches.append(p)
         p.start()
