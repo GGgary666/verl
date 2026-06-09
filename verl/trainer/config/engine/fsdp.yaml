@@ -89,3 +89,12 @@ qat:
 
   # Path to vLLM quantization config JSON file
   quantization_config_path: null
+
+  # W4A4 activation calibration (auto-run when input_global_scale is uninitialized)
+  calib_enable: true
+  calib_num_samples: 32
+  calib_max_seq_len: 2048
+  calib_batch_size: 2
+  calib_data_files: null
+  calib_prompt_key: prompt
+  calib_seed: 42

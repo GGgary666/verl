@@ -506,6 +506,15 @@ class FSDPEngine(BaseEngine):
 
         if self._qat_config.mode == "w4a4":
             self._restore_w4a4_input_scales(module, self.model_config.local_path)
+            from verl.utils.device import get_device_name
+            from verl.utils.qat.calibration import maybe_calibrate_w4a4_activations
+
+            maybe_calibrate_w4a4_activations(
+                module,
+                self._qat_config,
+                tokenizer=getattr(self.model_config, "tokenizer", None),
+                device=torch.device(get_device_name()),
+            )
 
         return module
 

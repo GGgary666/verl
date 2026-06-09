@@ -37,6 +37,14 @@ class QATConfig(BaseConfig):
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
     quantization_config_path: Optional[str] = None
+    # W4A4 activation calibration (when checkpoint lacks input_global_scale/input_amax)
+    calib_enable: bool = True
+    calib_num_samples: int = 32
+    calib_max_seq_len: int = 2048
+    calib_batch_size: int = 2
+    calib_data_files: Optional[list[str]] = None
+    calib_prompt_key: str = "prompt"
+    calib_seed: int = 42
 
 
 def load_quantization_config(qat_config: QATConfig) -> dict[str, Any]:

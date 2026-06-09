@@ -35,12 +35,41 @@ from compressed_tensors.quantization.quant_args import (
 from compressed_tensors.quantization.utils.helpers import generate_gparam
 
 from verl.utils.device import get_device_name, get_torch_device
+from verl.utils.qat.calibration import input_global_scale_from_amax, is_scale_uninitialized
 from verl.utils.qat.compressed_tensors_compat import create_nvfp4_weight_packer
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 _LAYER_IDX_RE = re.compile(r"layers\.(\d+)\.")
+
+
+def _collect_fused_input_global_scales(
+    layer_params: dict[str, torch.Tensor],
+    input_global_scales: dict[str, torch.Tensor],
+    layer_names: set[str],
+) -> dict[str, torch.Tensor]:
+    """Resolve per-layer input_global_scale from buffers, with QKV/GateUp fusion."""
+    collected: dict[str, torch.Tensor] = {}
+
+    for layer_name in layer_names:
+        scale_key = f"{layer_name}.input_global_scale"
+        if scale_key in layer_params and not is_scale_uninitialized(layer_params[scale_key]):
+            collected[layer_name] = layer_params[scale_key]
+            continue
+
+        amax_key = f"{layer_name}.input_amax"
+        if amax_key in layer_params and not is_scale_uninitialized(layer_params[amax_key]):
+            collected[layer_name] = input_global_scale_from_amax(layer_params[amax_key])
+            continue
+
+        streamed = input_global_scales.get(layer_name)
+        if streamed is not None and not is_scale_uninitialized(streamed):
+            collected[layer_name] = streamed
+
+    if not collected:
+        return {}
+    return fuse_global_scales(collected, strategy="min")
 
 
 def compute_blockwise_scale(
@@ -236,6 +265,11 @@ class QATQuantizer:
             )
 
         fused_global_scales = fuse_global_scales(layer_global_scales, strategy="min")
+        fused_input_global_scales = (
+            _collect_fused_input_global_scales(layer_params, input_global_scales, set(weights_on_gpu.keys()))
+            if self._is_w4a4
+            else {}
+        )
 
         results = []
 
@@ -254,18 +288,14 @@ class QATQuantizer:
             results.append((f"{layer_name}.weight_global_scale", fused_global_scale.to(output_device)))
 
             if self._is_w4a4:
-                if layer_name in input_global_scales:
-                    results.append(
-                        (
-                            f"{layer_name}.input_global_scale",
-                            input_global_scales[layer_name].float().to(output_device),
-                        )
+                input_scale = fused_input_global_scales.get(layer_name)
+                if input_scale is None:
+                    logger.warning(
+                        f"W4A4: {layer_name} input_global_scale uninitialized, "
+                        "bootstrapping from weight amax until forward pass updates it"
                     )
-                else:
-                    raise ValueError(
-                        f"W4A4 mode requires input_global_scale for layer '{layer_name}', "
-                        f"but it's not found or uninitialized (-1.0)."
-                    )
+                    input_scale = input_global_scale_from_amax(torch.amax(torch.abs(weight_gpu)))
+                results.append((f"{layer_name}.input_global_scale", input_scale.float().to(output_device)))
 
         del weights_on_gpu, layer_global_scales, fused_global_scales
 
@@ -293,13 +323,17 @@ class QATQuantizer:
             tensor_cpu = tensor.to("cpu") if tensor.is_cuda else tensor
             layer_idx = self._extract_layer_idx(name)
 
-            # Collect input_global_scales for W4A4 as we go
+            # Collect input scales for W4A4 as we go (from scale buffer or amax observer)
             if self._is_w4a4 and "input_global_scale" in name:
                 scale_layer_name = name.replace(".input_global_scale", "")
-                if tensor_cpu.numel() == 1 and tensor_cpu.item() == -1.0:
+                if is_scale_uninitialized(tensor_cpu):
                     logger.warning(f"W4A4: {scale_layer_name} input_global_scale is uninitialized")
                 else:
                     input_global_scales[scale_layer_name] = tensor_cpu
+            elif self._is_w4a4 and "input_amax" in name:
+                scale_layer_name = name.replace(".input_amax", "")
+                if not is_scale_uninitialized(tensor_cpu):
+                    input_global_scales[scale_layer_name] = input_global_scale_from_amax(tensor_cpu)
 
             # Layer boundary: flush previous layer
             if layer_idx != current_layer_idx and current_layer_idx is not _sentinel and layer_buffer:

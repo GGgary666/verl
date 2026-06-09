@@ -28,6 +28,8 @@ version checks):
 - >=0.19: nvfp4_marlin_process_scales returns (tensor, scale_factor); global
   scale uses weight_global_scale and float32 inputs with a_dtype.
 - >=0.20: MoE classes move under compressed_tensors_moe.* submodules.
+- W4A4 >=0.19: swizzle_blockscale moves to nvfp4_utils; linear uses kernel API
+  (weight_packed -> weight + kernel.process_weights_after_loading).
 """
 
 import importlib
@@ -426,9 +428,41 @@ def patched_w4a16_process_weights_after_loading(self, layer: torch.nn.Module) ->
         delattr(layer, "weight_global_scale")
 
 
-def patched_w4a4_process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-    """Patched process_weights_after_loading for W4A4 Dense (all backends)."""
-    from vllm.model_executor.layers.quantization.utils.quant_utils import swizzle_blockscale
+def _resolve_swizzle_blockscale():
+    """Resolve swizzle_blockscale across vLLM <=0.18 and >=0.19 layouts."""
+    for module_path in (
+        "vllm.model_executor.layers.quantization.utils.nvfp4_utils",
+        "vllm.model_executor.layers.quantization.utils.quant_utils",
+    ):
+        try:
+            module = importlib.import_module(module_path)
+        except ModuleNotFoundError:
+            continue
+        if hasattr(module, "swizzle_blockscale"):
+            return module.swizzle_blockscale
+    raise ImportError(
+        "Cannot import swizzle_blockscale from vLLM. "
+        "Upgrade vLLM or use a version that provides nvfp4_utils/quant_utils."
+    )
+
+
+def _w4a4_uses_kernel_api(scheme_self) -> bool:
+    """Detect NVFP4 linear kernel API introduced in vLLM 0.19+."""
+    if hasattr(scheme_self, "kernel"):
+        return True
+    backend = getattr(scheme_self, "backend", None)
+    if backend is not None and not isinstance(backend, str):
+        try:
+            importlib.import_module("vllm.model_executor.layers.quantization.utils.nvfp4_utils")
+            return True
+        except ModuleNotFoundError:
+            return False
+    return False
+
+
+def _patched_w4a4_legacy_process_weights(self, layer: torch.nn.Module) -> None:
+    """W4A4 patch for legacy vLLM layouts that keep weight_packed (<=0.18)."""
+    swizzle_blockscale = _resolve_swizzle_blockscale()
 
     is_first_call = _check_first_call(layer)
 
@@ -509,6 +543,102 @@ def patched_w4a4_process_weights_after_loading(self, layer: torch.nn.Module) -> 
                         requires_grad=False,
                     ),
                 )
+
+
+def _update_w4a4_tensor_ref(layer: torch.nn.Module, ref_name: str, new_param: Parameter) -> None:
+    """Update a CUDA-graph ref, replacing it when kernel repacking changes shape."""
+    refs = layer._marlin_tensor_refs
+    ref = refs.get(ref_name)
+    if ref is not None and ref.shape == new_param.shape:
+        ref.copy_(new_param.data)
+        setattr(layer, ref_name, Parameter(ref, requires_grad=False))
+    else:
+        if ref is not None:
+            logger.warning(
+                f"W4A4: _marlin_tensor_refs['{ref_name}'] shape changed "
+                f"{tuple(ref.shape)} -> {tuple(new_param.shape)}, replacing ref"
+            )
+        refs[ref_name] = new_param.data
+        setattr(layer, ref_name, new_param)
+
+
+def _patched_w4a4_kernel_process_weights(self, layer: torch.nn.Module) -> None:
+    """W4A4 patch for vLLM 0.19+ kernel API (weight_packed -> weight + kernel format)."""
+    is_first_call = _check_first_call(layer)
+
+    _W4A4_HF_PARAMS = ["weight_packed", "weight_scale", "weight_global_scale", "input_global_scale"]
+
+    if is_first_call:
+        for pname in _W4A4_HF_PARAMS:
+            save_param_meta(layer, pname)
+        if not hasattr(layer, "_weight_loaders"):
+            layer._weight_loaders = {}
+        for pname in _W4A4_HF_PARAMS:
+            param = getattr(layer, pname, None)
+            if param is not None and hasattr(param, "weight_loader"):
+                layer._weight_loaders[pname] = param.weight_loader
+
+    weight_packed_data = layer.weight_packed.data
+    weight_scale_data = layer.weight_scale.data
+    input_global_scale_data = layer.input_global_scale.data
+    weight_global_scale_data = layer.weight_global_scale.data
+
+    input_global_scale_inv = input_global_scale_data.max().to(torch.float32)
+    processed_input_global_scale = (1.0 / input_global_scale_inv).to(torch.float32)
+    weight_global_scale_max = weight_global_scale_data.max().to(torch.float32)
+    processed_weight_global_scale = 1.0 / weight_global_scale_max
+    processed_alpha = processed_input_global_scale * processed_weight_global_scale
+
+    layer.weight = Parameter(weight_packed_data.clone(), requires_grad=False)
+    if hasattr(layer, "weight_packed"):
+        delattr(layer, "weight_packed")
+    layer.weight_scale = Parameter(weight_scale_data.clone(), requires_grad=False)
+
+    if is_first_call:
+        layer.input_global_scale = Parameter(processed_input_global_scale, requires_grad=False)
+        layer.weight_global_scale = Parameter(processed_weight_global_scale, requires_grad=False)
+        layer.input_global_scale_inv = Parameter(input_global_scale_inv, requires_grad=False)
+        layer.alpha = Parameter(processed_alpha, requires_grad=False)
+        layer._marlin_tensor_refs = {
+            "weight": layer.weight.data,
+            "weight_scale": layer.weight_scale.data,
+            "input_global_scale": layer.input_global_scale.data,
+            "weight_global_scale": layer.weight_global_scale.data,
+            "input_global_scale_inv": layer.input_global_scale_inv.data,
+            "alpha": layer.alpha.data,
+        }
+    else:
+        layer.weight.data.copy_(weight_packed_data)
+        layer.weight_scale.data.copy_(weight_scale_data)
+        refs = layer._marlin_tensor_refs
+        refs["input_global_scale"].copy_(processed_input_global_scale)
+        refs["weight_global_scale"].copy_(processed_weight_global_scale)
+        refs["input_global_scale_inv"].copy_(input_global_scale_inv)
+        refs["alpha"].copy_(processed_alpha)
+        layer.input_global_scale = Parameter(refs["input_global_scale"], requires_grad=False)
+        layer.weight_global_scale = Parameter(refs["weight_global_scale"], requires_grad=False)
+        layer.input_global_scale_inv = Parameter(refs["input_global_scale_inv"], requires_grad=False)
+        layer.alpha = Parameter(refs["alpha"], requires_grad=False)
+
+    if hasattr(self, "kernel"):
+        self.kernel.process_weights_after_loading(layer)
+    else:
+        from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
+            convert_to_nvfp4_linear_kernel_format,
+        )
+
+        convert_to_nvfp4_linear_kernel_format(self.backend, layer)
+
+    _update_w4a4_tensor_ref(layer, "weight", layer.weight)
+    _update_w4a4_tensor_ref(layer, "weight_scale", layer.weight_scale)
+
+
+def patched_w4a4_process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+    """Patched process_weights_after_loading for W4A4 Dense (all backends)."""
+    if _w4a4_uses_kernel_api(self):
+        _patched_w4a4_kernel_process_weights(self, layer)
+    else:
+        _patched_w4a4_legacy_process_weights(self, layer)
 
 
 def _marlin_repack_experts(packed, perm, size_k, size_n, num_experts):

@@ -21,6 +21,7 @@ Module Structure:
 - core.py: QATConfig, apply_qat, enable_qat_fuse (training setup)
 - linear.py: QATLinear layer with Triton kernels for fake quantization
 - quantizer.py: QATQuantizer for true quantization + scale computation utilities
+- calibration.py: W4A4 activation calibration (input_global_scale / input_amax)
 - vllm_patch.py: Patches for vLLM dynamic weight loading
 
 Usage:
@@ -30,6 +31,7 @@ Usage:
     model = apply_qat(model, config)  # Before FSDP wrapping
 """
 
+from verl.utils.qat.calibration import maybe_calibrate_w4a4_activations, needs_w4a4_calibration
 from verl.utils.qat.core import (
     QATConfig,
     apply_qat,
@@ -50,6 +52,8 @@ __all__ = [
     "load_quantization_config",
     "enable_qat_fuse",
     "invalidate_all_scales",
+    "maybe_calibrate_w4a4_activations",
+    "needs_w4a4_calibration",
     # vLLM Patch
     "apply_qat_patches",
     "manual_process_weights_after_loading",

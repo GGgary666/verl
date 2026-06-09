@@ -136,6 +136,13 @@ class QATEngineConfig(BaseConfig):
         ignore_patterns (list[str]): Module name patterns to exclude from quantization
         activation_observer (str): Observer strategy for activation global_scale (W4A4 only)
         quantization_config_path (Optional[str]): Path to quantization config JSON for vLLM
+        calib_enable (bool): Auto-run W4A4 activation calibration if scales are uninitialized
+        calib_num_samples (int): Number of sequences for calibration
+        calib_max_seq_len (int): Max sequence length per calibration sample
+        calib_batch_size (int): Calibration micro-batch size
+        calib_data_files (Optional[list[str]]): Parquet files for calibration prompts
+        calib_prompt_key (str): Prompt column name in calibration parquet
+        calib_seed (int): Random seed for synthetic calibration fallback
     """
 
     enable: bool = False
@@ -144,6 +151,13 @@ class QATEngineConfig(BaseConfig):
     ignore_patterns: list[str] = field(default_factory=lambda: ["lm_head", "embed_tokens", "re:.*mlp.gate$"])
     activation_observer: str = "static_minmax"
     quantization_config_path: Optional[str] = None
+    calib_enable: bool = True
+    calib_num_samples: int = 32
+    calib_max_seq_len: int = 2048
+    calib_batch_size: int = 2
+    calib_data_files: Optional[list[str]] = None
+    calib_prompt_key: str = "prompt"
+    calib_seed: int = 42
 
 
 @dataclass
