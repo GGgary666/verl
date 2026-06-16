@@ -843,6 +843,14 @@ class AgentLoopWorker:
 
         final_output = outputs[-1]
         if final_output.reward_score is None and enable_async_reward:
+            # Pure distillation: task rewards are not used in the loss, so skip rule-based scoring.
+            if (
+                self.distillation_enabled
+                and not self.config.distillation.distillation_loss.use_task_rewards
+            ):
+                final_output.reward_score = 0.0
+                return
+
             timing = {}
             with simple_timer("compute_score", timing):
                 all_prompts, all_responses, all_input_ids, all_attention_mask, all_position_ids = [], [], [], [], []

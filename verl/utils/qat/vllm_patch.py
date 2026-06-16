@@ -33,6 +33,7 @@ version checks):
 """
 
 import importlib
+import inspect
 import logging
 import os
 from typing import Optional
@@ -680,9 +681,40 @@ def _marlin_process_scales_experts(scale_hf, param_dtype, size_k, size_n, group_
     return torch.stack(result)
 
 
+def _init_nvfp4_moe_kernel(self, layer: torch.nn.Module) -> None:
+    """Create NVFP4 MoE kernel on self.moe_kernel (vLLM >=0.20 API)."""
+    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import make_nvfp4_moe_kernel
+
+    self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+    if self.moe_quant_config is None:
+        return
+    if self.moe.moe_parallel_config.use_all2all_kernels and not self.moe.moe_parallel_config.use_naive_all2all_kernels:
+        return
+    assert self.experts_cls is not None
+
+    kernel_kwargs = {
+        "moe_quant_config": self.moe_quant_config,
+        "moe_config": self.moe,
+        "experts_cls": self.experts_cls,
+    }
+    sig = inspect.signature(make_nvfp4_moe_kernel)
+    if "routing_tables" in sig.parameters:
+        routing_tables = (
+            layer._maybe_init_expert_routing_tables() if hasattr(layer, "_maybe_init_expert_routing_tables") else None
+        )
+        kernel_kwargs["routing_tables"] = routing_tables
+    if "shared_experts" in sig.parameters:
+        kernel_kwargs["shared_experts"] = getattr(layer, "shared_experts", None)
+
+    self.moe_kernel = make_nvfp4_moe_kernel(**kernel_kwargs)
+    # Backward compat for vLLM versions that still read self.kernel.
+    self.kernel = self.moe_kernel
+    if hasattr(self.moe_kernel, "fused_experts"):
+        self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+
+
 def _process_nvfp4_moe_marlin(self, layer: torch.nn.Module, is_first_call: bool) -> None:
     """Process MoE layer with MARLIN backend (W4A16)."""
-    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import make_nvfp4_moe_kernel
     from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import marlin_make_workspace_new
 
     group_size = 16
@@ -756,24 +788,12 @@ def _process_nvfp4_moe_marlin(self, layer: torch.nn.Module, is_first_call: bool)
     layer.w13_input_scale = None
     layer.w2_input_scale = None
 
-    # Initialize kernel
-    self.moe_quant_config = self.get_fused_moe_quant_config(layer)
-    if self.moe_quant_config is not None and (
-        (not self.moe.moe_parallel_config.use_all2all_kernels) or self.moe.moe_parallel_config.use_naive_all2all_kernels
-    ):
-        self.kernel = make_nvfp4_moe_kernel(
-            moe_quant_config=self.moe_quant_config,
-            moe_config=self.moe,
-            experts_cls=self.experts_cls,
-        )
+    _init_nvfp4_moe_kernel(self, layer)
 
 
 def _process_nvfp4_moe_flashinfer_cutlass(self, layer: torch.nn.Module, is_first_call: bool) -> None:
     """Process MoE layer with FlashInfer/CUTLASS backend (W4A4)."""
-    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
-        convert_to_nvfp4_moe_kernel_format,
-        make_nvfp4_moe_kernel,
-    )
+    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import convert_to_nvfp4_moe_kernel_format
     from vllm.model_executor.utils import replace_parameter
 
     w13_packed = layer.w13_weight_packed.data
@@ -850,16 +870,7 @@ def _process_nvfp4_moe_flashinfer_cutlass(self, layer: torch.nn.Module, is_first
     layer.w13_input_scale = a13_scale
     layer.w2_input_scale = a2_scale
 
-    # Initialize kernel
-    self.moe_quant_config = self.get_fused_moe_quant_config(layer)
-    if self.moe_quant_config is not None and (
-        (not self.moe.moe_parallel_config.use_all2all_kernels) or self.moe.moe_parallel_config.use_naive_all2all_kernels
-    ):
-        self.kernel = make_nvfp4_moe_kernel(
-            moe_quant_config=self.moe_quant_config,
-            moe_config=self.moe,
-            experts_cls=self.experts_cls,
-        )
+    _init_nvfp4_moe_kernel(self, layer)
 
 
 # MoE NVFP4 Patches (entry points)
@@ -875,6 +886,8 @@ def patched_nvfp4_moe_process_weights_after_loading(self, layer: torch.nn.Module
         save_param_meta(layer, "w2_weight_packed")
         save_param_meta(layer, "w13_weight_scale")
         save_param_meta(layer, "w2_weight_scale")
+        save_param_meta(layer, "w13_input_global_scale")
+        save_param_meta(layer, "w2_input_global_scale")
         if not hasattr(layer, "_weight_loaders"):
             layer._weight_loaders = {}
         for pname in ["w13_weight_packed", "w2_weight_packed", "w13_weight_scale", "w2_weight_scale"]:
@@ -955,6 +968,101 @@ def apply_qat_patches():
     return _applied_patches
 
 
+_MOE_KERNEL_WEIGHT_NAMES = ("w13_weight", "w2_weight")
+_MOE_PACKED_TO_LOAD_ALIAS = (
+    ("w13_weight_packed", "w13_weight"),
+    ("w2_weight_packed", "w2_weight"),
+)
+
+
+def _reset_moe_quant_method_kernels(quant_method) -> None:
+    if quant_method is None:
+        return
+    for attr in ("moe_kernel", "kernel"):
+        if hasattr(quant_method, attr):
+            setattr(quant_method, attr, None)
+
+
+def _prepare_moe_layer_for_hf_reload(module: torch.nn.Module) -> None:
+    """Drop kernel-layout fused weights so the next load_weights sees HF buffers."""
+    for name in _MOE_KERNEL_WEIGHT_NAMES:
+        if hasattr(module, name):
+            delattr(module, name)
+    _reset_moe_quant_method_kernels(getattr(module, "quant_method", None))
+
+
+def _alias_moe_packed_weights_for_load(module: torch.nn.Module) -> None:
+    """Mirror vLLM pre-process_weights layout: w13/w2_weight alias HF packed tensors."""
+    weight_loaders = getattr(module, "_weight_loaders", {})
+    for packed_name, alias_name in _MOE_PACKED_TO_LOAD_ALIAS:
+        packed = getattr(module, packed_name, None)
+        if packed is None:
+            continue
+        loader = weight_loaders.get(packed_name) or getattr(packed, "weight_loader", None)
+        alias = Parameter(packed.data, requires_grad=False)
+        if loader is not None:
+            alias.weight_loader = loader
+        module.register_parameter(alias_name, alias)
+
+
+_MOE_LAYER_INPUT_SCALES = ("w13_input_global_scale", "w2_input_global_scale")
+
+
+def _ensure_moe_input_global_scale_params(module: torch.nn.Module, device=None) -> None:
+    """Ensure MoE layer has reloadable w13/w2 input scale parameters."""
+    dev = device or get_device_name()
+    for scale_name in _MOE_LAYER_INPUT_SCALES:
+        if hasattr(module, scale_name):
+            continue
+        param = Parameter(torch.tensor([1.0], dtype=torch.float32, device=dev), requires_grad=False)
+        module.register_parameter(scale_name, param)
+
+
+def _install_moe_input_scale_reload_hooks(module: torch.nn.Module, device=None) -> None:
+    """Allow FSDP export keys (experts.w13/w2_input_global_scale) to reload MoE layer scales."""
+    _ensure_moe_input_global_scale_params(module, device=device)
+    for scale_name in _MOE_LAYER_INPUT_SCALES:
+        param = getattr(module, scale_name)
+
+        def _make_loader(target_param):
+            def _loader(param_like, loaded_weight, name=None):
+                target_param.data.copy_(loaded_weight.reshape_as(target_param.data).to(target_param.dtype))
+
+            return _loader
+
+        if not hasattr(param, "weight_loader") or param.weight_loader is None:
+            param.weight_loader = _make_loader(param)
+
+
+def _aggregate_moe_expert_input_scales(module: torch.nn.Module) -> None:
+    """If only per-expert HF input scales were loaded, promote min scale to layer w13/w2 buffers."""
+    w13_candidates = []
+    w2_candidates = []
+    for name, param in module.named_parameters(recurse=False):
+        if name.endswith("input_global_scale") and param.numel() == 1:
+            if "w13" in name or name.startswith("w13"):
+                w13_candidates.append(param.data)
+    for child_name, child in module.named_modules():
+        if child is module:
+            continue
+        if not child_name.endswith(".gate_proj") and not child_name.endswith(".up_proj"):
+            if child_name.endswith(".down_proj"):
+                scale = getattr(child, "input_global_scale", None)
+                if scale is not None and scale.numel() == 1:
+                    w2_candidates.append(scale.data)
+            continue
+        scale = getattr(child, "input_global_scale", None)
+        if scale is not None and scale.numel() == 1:
+            w13_candidates.append(scale.data)
+
+    if w13_candidates and hasattr(module, "w13_input_global_scale"):
+        fused = torch.min(torch.stack([s.float().reshape(1) for s in w13_candidates]))
+        module.w13_input_global_scale.data.copy_(fused.to(module.w13_input_global_scale.dtype))
+    if w2_candidates and hasattr(module, "w2_input_global_scale"):
+        fused = torch.min(torch.stack([s.float().reshape(1) for s in w2_candidates]))
+        module.w2_input_global_scale.data.copy_(fused.to(module.w2_input_global_scale.dtype))
+
+
 def prepare_qat_for_load_weights(model, device=None):
     """
     Prepare QAT model for weight loading. Call ONCE before multi-bucket weight loading.
@@ -972,9 +1080,17 @@ def prepare_qat_for_load_weights(model, device=None):
     param_meta.prepare_for_reload()
     logger.info(f"[prepare_qat] Tensor swap prepared for {len(param_meta._tensor_swap_layers)} layers")
 
-    # Rebuild deleted (W4A16) or overwritten (W4A4) params back to HF format
+    moe_reset_count = 0
+    for cache_entry in param_meta._layer_meta_cache.values():
+        meta = cache_entry["meta"]
+        if "w13_weight_packed" not in meta:
+            continue
+        _prepare_moe_layer_for_hf_reload(cache_entry["module"])
+        moe_reset_count += 1
+
+    # Rebuild deleted (W4A16/W4A4) or kernel-overwritten params back to HF format
     rebuilt_count = 0
-    for layer_name, cache_entry in param_meta._layer_meta_cache.items():
+    for cache_entry in param_meta._layer_meta_cache.values():
         module = cache_entry["module"]
         for param_name, pm in cache_entry["meta"].items():
             existing = getattr(module, param_name, None)
@@ -991,7 +1107,18 @@ def prepare_qat_for_load_weights(model, device=None):
             module.register_parameter(param_name, new_param)
             rebuilt_count += 1
 
-    logger.info(f"[prepare_qat] Rebuilt {rebuilt_count} parameters")
+    alias_count = 0
+    for cache_entry in param_meta._layer_meta_cache.values():
+        if "w13_weight_packed" not in cache_entry["meta"]:
+            continue
+        _alias_moe_packed_weights_for_load(cache_entry["module"])
+        _install_moe_input_scale_reload_hooks(cache_entry["module"], device=device)
+        alias_count += 1
+
+    logger.info(
+        f"[prepare_qat] MoE HF reload prep: reset={moe_reset_count}, "
+        f"rebuilt={rebuilt_count}, aliased={alias_count}"
+    )
     inner_model._param_meta_for_restore = param_meta
     return param_meta
 
@@ -1017,6 +1144,8 @@ def manual_process_weights_after_loading(model):
                 if "KVCache" in quant_method.__class__.__name__:
                     continue
                 quant_method.process_weights_after_loading(module)
+                if "w13_weight_packed" in getattr(module, "_hf_param_meta", {}):
+                    _aggregate_moe_expert_input_scales(module)
                 moe_count += 1
 
     logger.debug(f"Processed {dense_count} dense layers, {moe_count} MoE layers")

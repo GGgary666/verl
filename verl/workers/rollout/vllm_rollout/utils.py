@@ -27,6 +27,11 @@ from vllm.outputs import RequestOutput
 from verl.plugin.platform import get_platform
 from verl.utils.device import is_npu_available
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack
+from verl.utils.model import (
+    align_actor_weight_names_for_vllm,
+    prepare_moe_weights_for_vllm_rollout,
+    resolve_moe_sizes_from_hf_config,
+)
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 from verl.utils.vllm.vllm_fp8_utils import apply_vllm_fp8_patches, is_fp8_model, load_quanted_weights
 
@@ -89,6 +94,32 @@ def get_vllm_max_lora_rank(lora_rank: int):
     for rank in vllm_max_lora_ranks:
         if lora_rank <= rank:
             return rank
+
+
+def _restore_4d_moe_weights_to_3d(models):
+    """Convert 4D packed MoE weights back to standard 3D fused format.
+
+    vLLM >= 0.22 may internally convert 3D fused MoE weights
+    ``[E, 2*inter, hidden]`` to a 4D packed block layout during
+    ``process_weights_after_loading``.  When verl reloads weights via IPC,
+    the direct-copy path writes into the 4D param in-place, leaving it in
+    packed format.  Before ``process_weights_after_loading`` runs again we
+    must restore the 3D layout so the kernel setup code can re-pack
+    correctly.
+    """
+    for model in models:
+        for name, param in model.named_parameters():
+            if param.dim() != 4:
+                continue
+            if "w13_weight" not in name and "w2_weight" not in name:
+                continue
+            # Reshape [E, X, Y, Z] → [E, X, Y*Z]
+            E, X, Y, Z = param.shape
+            param.data = param.data.reshape(E, X, Y * Z).contiguous()
+            logger.debug(
+                "Restored 4D MoE weight %s [%d,%d,%d,%d] → 3D [%d,%d,%d]",
+                name, E, X, Y, Z, E, X, Y * Z,
+            )
 
 
 # https://github.com/vllm-project/vllm/issues/13175
@@ -260,6 +291,13 @@ class vLLMColocateWorkerExtension:
             # Some post-load transforms are non-idempotent; run once after all buckets.
             from vllm.model_executor.model_loader.utils import process_weights_after_loading
 
+            # Convert any 4D packed MoE weights back to standard 3D format
+            # before process_weights_after_loading, which expects 3D fused
+            # weights (vLLM >= 0.22 may internally reshape 3D → 4D during
+            # process_weights_after_loading, so we must restore the 3D
+            # format before it runs again).
+            _restore_4d_moe_weights_to_3d(self._iter_all_models())
+
             for model, model_config in self._iter_all_models_with_config():
                 process_weights_after_loading(model, model_config, self.device)
 
@@ -288,8 +326,24 @@ class vLLMColocateWorkerExtension:
                     load_quanted_weights(weights, self.model_runner, is_drafter=True)
             else:
                 logger.info("Loading standard weights (non-FP8, async)")
+                model_config = self.model_runner.vllm_config.model_config
+                hf_config = getattr(model_config, "hf_text_config", None) or model_config.hf_config
+                moe_sizes = resolve_moe_sizes_from_hf_config(hf_config)
+                if moe_sizes == (None, None):
+                    logger.warning(
+                        "split_fused_moe_experts: could not resolve MoE sizes from vLLM hf_config "
+                        "(will rely on shape heuristics)"
+                    )
+                weights = prepare_moe_weights_for_vllm_rollout(weights, *moe_sizes)
+                moe_samples = [
+                    (name, tuple(weight.shape))
+                    for name, weight in weights
+                    if "experts" in name and "shared_expert" not in name
+                ][:5]
+                if moe_samples:
+                    logger.info("MoE weight samples before vLLM load: %s", moe_samples)
                 for model in self._iter_all_models():
-                    model.load_weights(weights)
+                    model.load_weights(align_actor_weight_names_for_vllm(weights, model))
 
     def _get_zmq_handle(self) -> str:
         """Get ZMQ handle for communication.

@@ -42,7 +42,47 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 _LAYER_IDX_RE = re.compile(r"layers\.(\d+)\.")
+_MOE_EXPERT_PROJ_RE = re.compile(r"\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)$")
 
+
+def _collect_moe_expert_input_scales(layer_params: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Map MoE expert projection module names to layer-level w13/w2 input scales."""
+    w13_by_experts: dict[str, torch.Tensor] = {}
+    w2_by_experts: dict[str, torch.Tensor] = {}
+
+    for name, tensor in layer_params.items():
+        if name.endswith(".experts.w13_input_global_scale") and not is_scale_uninitialized(tensor):
+            w13_by_experts[name.replace(".w13_input_global_scale", "")] = tensor
+        elif name.endswith(".experts.w2_input_global_scale") and not is_scale_uninitialized(tensor):
+            w2_by_experts[name.replace(".w2_input_global_scale", "")] = tensor
+        elif name.endswith(".experts.w13_input_amax") and not is_scale_uninitialized(tensor):
+            experts_base = name.replace(".w13_input_amax", "")
+            w13_by_experts.setdefault(experts_base, input_global_scale_from_amax(tensor))
+        elif name.endswith(".experts.w2_input_amax") and not is_scale_uninitialized(tensor):
+            experts_base = name.replace(".w2_input_amax", "")
+            w2_by_experts.setdefault(experts_base, input_global_scale_from_amax(tensor))
+
+    expert_scales: dict[str, torch.Tensor] = {}
+    for layer_name in layer_params:
+        if not layer_name.endswith(".weight"):
+            continue
+        module_name = layer_name.rsplit(".weight", 1)[0]
+        match = _MOE_EXPERT_PROJ_RE.search(module_name)
+        if not match:
+            continue
+        experts_base = module_name[: match.start() + len(".experts")]
+        proj = match.group(2)
+        if proj in ("gate_proj", "up_proj"):
+            scale = w13_by_experts.get(experts_base)
+        else:
+            scale = w2_by_experts.get(experts_base)
+        if scale is not None:
+            expert_scales[module_name] = scale
+    return expert_scales
+
+
+def _is_moe_expert_projection(layer_name: str) -> bool:
+    return _MOE_EXPERT_PROJ_RE.search(layer_name) is not None
 
 def _collect_fused_input_global_scales(
     layer_params: dict[str, torch.Tensor],
@@ -270,6 +310,17 @@ class QATQuantizer:
             if self._is_w4a4
             else {}
         )
+        if self._is_w4a4:
+            moe_input_scales = _collect_moe_expert_input_scales(layer_params)
+            for layer_name, scale in moe_input_scales.items():
+                fused_input_global_scales.setdefault(layer_name, scale)
+
+        moe_buffer_results: list[tuple[str, torch.Tensor]] = []
+        if self._is_w4a4:
+            for name, tensor in layer_params.items():
+                if name.endswith(".experts.w13_input_global_scale") or name.endswith(".experts.w2_input_global_scale"):
+                    if not is_scale_uninitialized(tensor):
+                        moe_buffer_results.append((name, tensor.float().to(output_device)))
 
         results = []
 
@@ -290,12 +341,18 @@ class QATQuantizer:
             if self._is_w4a4:
                 input_scale = fused_input_global_scales.get(layer_name)
                 if input_scale is None:
+                    if _is_moe_expert_projection(layer_name):
+                        raise RuntimeError(
+                            f"W4A4 MoE: {layer_name} missing layer-level w13/w2 input_global_scale buffer"
+                        )
                     logger.warning(
                         f"W4A4: {layer_name} input_global_scale uninitialized, "
                         "bootstrapping from weight amax until forward pass updates it"
                     )
                     input_scale = input_global_scale_from_amax(torch.amax(torch.abs(weight_gpu)))
                 results.append((f"{layer_name}.input_global_scale", input_scale.float().to(output_device)))
+
+        results.extend(moe_buffer_results)
 
         del weights_on_gpu, layer_global_scales, fused_global_scales
 

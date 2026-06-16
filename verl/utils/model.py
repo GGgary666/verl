@@ -16,13 +16,16 @@ Utilities to create common models from huggingface
 """
 
 import json
+import logging
 import os
 import re
 import warnings
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Iterable, Iterator, Optional
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 import torch
 from tensordict.tensorclass import NonTensorData
 from torch import nn
@@ -283,6 +286,288 @@ def check_exclude_modules(config, key: str) -> bool:
         elif any(key.endswith(f".{exclude_key}") for exclude_key in config.exclude_modules):
             return True
     return False
+
+
+def _get_model_config(model: nn.Module) -> Any:
+    """Walk FSDP/PEFT wrappers to find the underlying ``PretrainedConfig``."""
+    module = model
+    for _ in range(6):
+        config = getattr(module, "config", None)
+        if config is not None:
+            return config
+        if hasattr(module, "_fsdp_wrapped_module"):
+            module = module._fsdp_wrapped_module
+        elif hasattr(module, "module"):
+            module = module.module
+        else:
+            break
+    return getattr(module, "config", None)
+
+
+def resolve_moe_sizes_from_hf_config(config: Any) -> tuple[Optional[int], Optional[int]]:
+    """Return ``(hidden_size, moe_intermediate_size)`` from HF / vLLM config."""
+    if config is None:
+        return None, None
+    text_config = getattr(config, "text_config", None)
+    hidden_size = (
+        getattr(config, "hidden_size", None)
+        or getattr(config, "hidden_dim", None)
+        or (getattr(text_config, "hidden_size", None) if text_config else None)
+        or (getattr(text_config, "hidden_dim", None) if text_config else None)
+    )
+    moe_intermediate_size = (
+        getattr(config, "moe_intermediate_size", None)
+        or getattr(config, "intermediate_size", None)
+        or (getattr(text_config, "moe_intermediate_size", None) if text_config else None)
+        or (getattr(text_config, "intermediate_size", None) if text_config else None)
+    )
+    return hidden_size, moe_intermediate_size
+
+
+def resolve_hidden_and_moe_intermediate_sizes(model: nn.Module) -> tuple[Optional[int], Optional[int]]:
+    """Return ``(hidden_size, moe_intermediate_size)`` from the training model config."""
+    return resolve_moe_sizes_from_hf_config(_get_model_config(model))
+
+
+def _is_routed_fused_moe_proj(name: str, proj: str) -> bool:
+    """True for routed expert fused projections; excludes shared-expert MLP weights."""
+    if "shared_expert" in name:
+        return False
+    if proj not in name or "experts" not in name:
+        return False
+    # Match HF keys and PEFT ``.base_layer.weight`` exports from FSDP state_dict.
+    return bool(
+        re.search(rf"experts\.{re.escape(proj)}(?:\.base_layer)?(?:\.weight)?$", name)
+    )
+
+
+def _strip_fused_moe_expert_suffix(name: str, proj: str) -> Optional[str]:
+    """Return base prefix before ``.{proj}`` or ``.{proj}.weight`` for fused expert keys."""
+    for suffix in (
+        f".{proj}.base_layer.weight",
+        f".{proj}.weight",
+        f".{proj}.base_layer",
+        f".{proj}",
+    ):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return None
+
+
+def _infer_gate_up_layout(dim1: int, dim2: int) -> str:
+    """Infer stacked vs legacy layout from a single expert slice shape heuristic."""
+    if dim1 > dim2:
+        return "legacy"
+    return "stacked"
+
+
+def _split_gate_up_proj(
+    name: str,
+    tensor: torch.Tensor,
+    hidden_size: Optional[int],
+    moe_intermediate_size: Optional[int],
+) -> Iterator[tuple[str, torch.Tensor]]:
+    gate_up_base = _strip_fused_moe_expert_suffix(name, "gate_up_proj")
+    if gate_up_base is None:
+        return
+
+    num_experts, dim1, dim2 = tensor.shape
+    two_inter = 2 * moe_intermediate_size if moe_intermediate_size else None
+    legacy_bmm = bool(two_inter and hidden_size and dim1 == hidden_size and dim2 == two_inter)
+    stacked = bool(two_inter and hidden_size and dim1 == two_inter and dim2 == hidden_size)
+    if not legacy_bmm and not stacked:
+        layout = _infer_gate_up_layout(dim1, dim2)
+        legacy_bmm = layout == "legacy"
+        stacked = layout == "stacked"
+
+    for expert_idx in range(num_experts):
+        gate_up = tensor[expert_idx]
+        if legacy_bmm:
+            half_inter = dim2 // 2
+            gate, up = gate_up[:, :half_inter].T.contiguous(), gate_up[:, half_inter:].T.contiguous()
+        else:
+            half_inter = dim1 // 2
+            gate, up = gate_up[:half_inter].contiguous(), gate_up[half_inter:].contiguous()
+        yield f"{gate_up_base}.{expert_idx}.gate_proj.weight", gate
+        yield f"{gate_up_base}.{expert_idx}.up_proj.weight", up
+
+
+def _split_down_proj(
+    name: str,
+    tensor: torch.Tensor,
+    hidden_size: Optional[int],
+    moe_intermediate_size: Optional[int],
+) -> Iterator[tuple[str, torch.Tensor]]:
+    down_base = _strip_fused_moe_expert_suffix(name, "down_proj")
+    if down_base is None:
+        return
+
+    num_experts, dim1, dim2 = tensor.shape
+    if (
+        moe_intermediate_size
+        and hidden_size
+        and dim1 == moe_intermediate_size
+        and dim2 == hidden_size
+    ):
+        transpose = True
+    elif (
+        moe_intermediate_size
+        and hidden_size
+        and dim1 == hidden_size
+        and dim2 == moe_intermediate_size
+    ):
+        transpose = False
+    else:
+        transpose = dim1 < dim2
+    for expert_idx in range(num_experts):
+        expert_slice = tensor[expert_idx]
+        down = expert_slice.T if transpose else expert_slice
+        yield f"{down_base}.{expert_idx}.down_proj.weight", down.contiguous()
+
+
+def _split_stacked_expert_proj(
+    name: str,
+    tensor: torch.Tensor,
+    proj: str,
+    hidden_size: Optional[int],
+    moe_intermediate_size: Optional[int],
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Split 3D stacked ``experts.{proj}`` tensors into per-expert 2D weights."""
+    base = _strip_fused_moe_expert_suffix(name, proj)
+    if base is None:
+        return
+
+    num_experts, dim1, dim2 = tensor.shape
+    if (
+        moe_intermediate_size
+        and hidden_size
+        and dim1 == moe_intermediate_size
+        and dim2 == hidden_size
+    ):
+        transpose = False
+    elif (
+        moe_intermediate_size
+        and hidden_size
+        and dim1 == hidden_size
+        and dim2 == moe_intermediate_size
+    ):
+        transpose = True
+    else:
+        transpose = dim1 > dim2
+    for expert_idx in range(num_experts):
+        expert_slice = tensor[expert_idx]
+        weight = expert_slice.T if transpose else expert_slice
+        yield f"{base}.{expert_idx}.{proj}.weight", weight.contiguous()
+
+
+def split_fused_moe_experts(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    hidden_size: Optional[int] = None,
+    moe_intermediate_size: Optional[int] = None,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Split fused MoE expert tensors for vLLM rollout weight sync.
+
+    Supports both HuggingFace layouts:
+    - Legacy (e.g. transformers 4.57): gate_up ``(E, hidden, 2*inter)``, down ``(E, inter, hidden)``
+    - Stacked (e.g. transformers 5.x): gate_up ``(E, 2*inter, hidden)``, down ``(E, hidden, inter)``
+    """
+    for name, tensor in weights:
+        if not isinstance(tensor, torch.Tensor) or tensor.dim() != 3:
+            yield name, tensor
+            continue
+
+        if _is_routed_fused_moe_proj(name, "gate_up_proj"):
+            yield from _split_gate_up_proj(name, tensor, hidden_size, moe_intermediate_size)
+            continue
+
+        if _is_routed_fused_moe_proj(name, "down_proj"):
+            yield from _split_down_proj(name, tensor, hidden_size, moe_intermediate_size)
+            continue
+
+        for proj in ("gate_proj", "up_proj"):
+            if _is_routed_fused_moe_proj(name, proj):
+                yield from _split_stacked_expert_proj(
+                    name, tensor, proj, hidden_size, moe_intermediate_size
+                )
+                break
+        else:
+            proj = None
+        if proj is not None:
+            continue
+
+        if "gate_up_proj" in name or "down_proj" in name or "experts.gate_proj" in name:
+            logger.error(
+                "split_fused_moe_experts: unresolved 3D MoE weight %s shape=%s "
+                "(hidden_size=%s, moe_intermediate_size=%s)",
+                name,
+                tuple(tensor.shape),
+                hidden_size,
+                moe_intermediate_size,
+            )
+        yield name, tensor
+
+
+def prepare_moe_weights_for_vllm_rollout(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    hidden_size: Optional[int] = None,
+    moe_intermediate_size: Optional[int] = None,
+) -> list[tuple[str, torch.Tensor]]:
+    """Split fused MoE tensors into per-expert 2D weights for vLLM IPC reload.
+
+    vLLM's initial checkpoint load accepts 3D ``gate_up_proj`` / ``down_proj``, but
+    the dynamic IPC reload path used in verl rollout expects per-expert 2D
+    ``gate_proj`` / ``up_proj`` / ``down_proj`` weights (see ``get_expert_mapping``).
+    """
+    weights = list(split_fused_moe_experts(weights, hidden_size, moe_intermediate_size))
+    unresolved_3d_moe = [
+        (name, tuple(weight.shape))
+        for name, weight in weights
+        if (
+            isinstance(weight, torch.Tensor)
+            and weight.dim() == 3
+            and "experts" in name
+            and "shared_expert" not in name
+        )
+    ]
+    if unresolved_3d_moe:
+        sample = unresolved_3d_moe[:5]
+        raise ValueError(
+            "3D routed MoE weights remain after split_fused_moe_experts; vLLM expects "
+            "per-expert 2D gate_proj/up_proj/down_proj weights. "
+            f"hidden_size={hidden_size}, moe_intermediate_size={moe_intermediate_size}, "
+            f"examples={sample}"
+        )
+    return weights
+
+
+def vllm_expects_language_model_weight_prefix(vllm_model: nn.Module) -> bool:
+    """Return True when the vLLM rollout model stores LM weights under ``language_model.model.*``."""
+    return any(name.startswith("language_model.model.") for name, _ in vllm_model.named_parameters())
+
+
+def align_actor_weight_names_for_vllm(
+    weights: Iterable[tuple[str, torch.Tensor]],
+    vllm_model: nn.Module,
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Remap text-only actor checkpoints to vLLM Qwen3.5-VL language-model prefixes.
+
+    FSDP actors trained with ``Qwen3_5*ForCausalLM`` export ``model.layers.*`` keys,
+    while vLLM hybrid models loaded with ``language_model_only`` expect
+    ``language_model.model.layers.*``. Without this remap, MoE weights can hit the
+    wrong loader and fail with fused-expert shape errors.
+    """
+    if not vllm_expects_language_model_weight_prefix(vllm_model):
+        yield from weights
+        return
+
+    for name, tensor in weights:
+        if (
+            name.startswith("model.")
+            and not name.startswith("model.language_model.")
+            and not name.startswith("model.visual.")
+        ):
+            name = f"language_model.{name}"
+        yield name, tensor
 
 
 def check_target_modules(config, key: str) -> bool:

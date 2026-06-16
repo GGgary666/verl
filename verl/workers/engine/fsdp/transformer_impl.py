@@ -59,7 +59,10 @@ from verl.utils.fsdp_utils import (
     offload_fsdp_optimizer,
     replace_lora_wrapper,
 )
-from verl.utils.model import convert_weight_keys, extract_multi_modal_inputs
+from verl.utils.model import (
+    convert_weight_keys,
+    extract_multi_modal_inputs,
+)
 from verl.utils.py_functional import convert_to_regular_types
 from verl.utils.torch_functional import logprobs_from_logits
 from verl.utils.ulysses import (
@@ -506,17 +509,27 @@ class FSDPEngine(BaseEngine):
 
         if self._qat_config.mode == "w4a4":
             self._restore_w4a4_input_scales(module, self.model_config.local_path)
-            from verl.utils.device import get_device_name
-            from verl.utils.qat.calibration import maybe_calibrate_w4a4_activations
-
-            maybe_calibrate_w4a4_activations(
-                module,
-                self._qat_config,
-                tokenizer=getattr(self.model_config, "tokenizer", None),
-                device=torch.device(get_device_name()),
-            )
 
         return module
+
+    def _maybe_calibrate_w4a4_after_fsdp(self, module):
+        if not self._qat_enabled or self.engine_config.forward_only:
+            return
+        if self._qat_config.mode != "w4a4":
+            return
+
+        from verl.utils.device import get_device_name, get_torch_device
+        from verl.utils.qat.calibration import maybe_calibrate_w4a4_activations
+
+        maybe_calibrate_w4a4_activations(
+            module,
+            self._qat_config,
+            tokenizer=self.model_config.tokenizer,
+            device=torch.device(get_device_name()),
+            post_fsdp=True,
+        )
+        get_torch_device().empty_cache()
+        torch.distributed.barrier()
 
     def _restore_w4a4_input_scales(self, model, model_path):
         """Restore input_global_scale and input_amax from checkpoint for W4A4 mode."""
@@ -572,6 +585,7 @@ class FSDPEngine(BaseEngine):
         log_gpu_memory_usage("Before FSDP", logger=None)
         module = self._build_fsdp_module(module)
         log_gpu_memory_usage("After FSDP", logger=None)
+        self._maybe_calibrate_w4a4_after_fsdp(module)
 
         if not self.engine_config.forward_only:
             # Initialize optimizer with model parameters and config settings
@@ -855,6 +869,9 @@ class FSDPEngine(BaseEngine):
                 )
                 for name, param in params.items()
             )
+
+        # Keep native 3D fused MoE weights on the sender; the vLLM rollout receiver
+        # decides whether to split for legacy vLLM versions.
 
         if self._qat_enabled:
             from verl.utils.qat.quantizer import QATQuantizer

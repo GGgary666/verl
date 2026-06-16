@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import contextmanager
 from typing import Any, Iterable, Iterator, Optional
 
@@ -27,6 +28,7 @@ from compressed_tensors.quantization.quant_args import FP4_E2M1_DATA, FP8_E4M3_D
 from verl.utils.device import get_device_name, get_torch_device
 
 logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 UNINITIALIZED_SCALE = -1.0
 
@@ -57,9 +59,23 @@ def count_uninitialized_w4a4_modules(model: nn.Module) -> tuple[int, int]:
     return total, uninitialized
 
 
+def count_uninitialized_moe_layers(model: nn.Module) -> tuple[int, int]:
+    """Return (total_moe_layers, uninitialized_layers)."""
+    from verl.utils.qat.moe import count_uninitialized_moe_layers as _count_moe
+
+    return _count_moe(model)
+
+
+def needs_moe_calibration(model: nn.Module) -> bool:
+    from verl.utils.qat.moe import needs_moe_calibration as _needs_moe
+
+    return _needs_moe(model)
+
+
 def needs_w4a4_calibration(model: nn.Module) -> bool:
-    total, uninitialized = count_uninitialized_w4a4_modules(model)
-    return total > 0 and uninitialized > 0
+    linear_total, linear_uninit = count_uninitialized_w4a4_modules(model)
+    moe_total, moe_uninit = count_uninitialized_moe_layers(model)
+    return (linear_total > 0 and linear_uninit > 0) or (moe_total > 0 and moe_uninit > 0)
 
 
 def _normalize_device(device: Optional[torch.device | int | str]) -> torch.device:
@@ -82,9 +98,15 @@ def _get_model_weight_dtype(model: nn.Module) -> torch.dtype:
         return torch.float32
 
 
+def _is_fsdp_wrapped(model: nn.Module) -> bool:
+    from verl.utils.fsdp_utils import fsdp_version
+
+    return fsdp_version(model) > 0
+
+
 @contextmanager
 def _calibration_forward_context(model: nn.Module, device: torch.device) -> Iterator[None]:
-    """Use sdpa + bf16 autocast for pre-FSDP fp32-weight calibration forwards."""
+    """Use sdpa + bf16 autocast for post-FSDP calibration forwards."""
     config = getattr(model, "config", None)
     original_attn = getattr(config, "_attn_implementation", None) if config is not None else None
     weight_dtype = _get_model_weight_dtype(model)
@@ -92,7 +114,7 @@ def _calibration_forward_context(model: nn.Module, device: torch.device) -> Iter
     if config is not None and original_attn in ("flash_attention_2", "flash_attention_3"):
         config._attn_implementation = "sdpa"
         logger.info(
-            "[QAT W4A4 Calib] Switched attention %s -> sdpa (pre-FSDP model_dtype=%s, flash-attn needs bf16/fp16)",
+            "[QAT W4A4 Calib] Switched attention %s -> sdpa (model_dtype=%s, flash-attn needs bf16/fp16)",
             original_attn,
             weight_dtype,
         )
@@ -115,7 +137,7 @@ def _collate_tokenized(samples: list[dict[str, torch.Tensor]], pad_token_id: int
         pad_len = max_len - ids.shape[0]
         if pad_len > 0:
             ids = torch.cat([ids, torch.full((pad_len,), pad_token_id, dtype=ids.dtype)])
-            mask = torch.cat([torch.ones(ids.shape[0] - pad_len), torch.zeros(pad_len, dtype=torch.long)])
+            mask = torch.cat([torch.ones(ids.shape[0] - pad_len, dtype=torch.long), torch.zeros(pad_len, dtype=torch.long)])
         else:
             mask = torch.ones(ids.shape[0], dtype=torch.long)
         input_ids.append(ids)
@@ -152,29 +174,55 @@ def _tokenize_prompt(tokenizer, prompt: Any, max_seq_len: int) -> dict[str, torc
     return tokenizer(text, return_tensors="pt", truncation=True, max_length=max_seq_len)
 
 
+def _ensure_fsdp_model_on_device(model: nn.Module, device: torch.device) -> tuple[torch.device, bool]:
+    """Load an FSDP-wrapped model onto ``device`` for calibration if needed."""
+    if not _is_fsdp_wrapped(model):
+        raise RuntimeError(
+            "[QAT W4A4 Calib] Activation calibration must run on an FSDP-wrapped model after wrap; "
+            "got a non-FSDP module."
+        )
+
+    model_device = _get_model_device(model)
+    if model_device.type == "meta":
+        raise RuntimeError("[QAT W4A4 Calib] FSDP model is still on meta device; cannot run activation calibration.")
+
+    if model_device.type == "cuda":
+        return model_device, False
+
+    if model_device.type == "cpu" and device.type == "cuda":
+        from verl.utils.fsdp_utils import load_fsdp_model_to_gpu
+
+        load_fsdp_model_to_gpu(model)
+        logger.info("[QAT W4A4 Calib] Loaded FSDP model to %s for activation calibration", device)
+        return torch.device("cpu"), True
+
+    raise RuntimeError(
+        f"[QAT W4A4 Calib] Unsupported model device {model_device} for activation calibration on {device}"
+    )
+
+
+def _restore_fsdp_model_device(model: nn.Module, restore_device: torch.device, moved: bool) -> None:
+    if not moved:
+        return
+
+    if restore_device.type == "cpu":
+        from verl.utils.fsdp_utils import offload_fsdp_model_to_cpu
+
+        offload_fsdp_model_to_cpu(model)
+    else:
+        model.to(restore_device)
+    logger.info("[QAT W4A4 Calib] Restored model to %s after activation calibration", restore_device)
+
+
 def _run_forward_batches(
     model: nn.Module,
     batches: Iterable[dict[str, torch.Tensor]],
     device: torch.device,
     max_batches: int,
 ) -> int:
-    model_device = _get_model_device(model)
+    restore_device, moved = _ensure_fsdp_model_on_device(model, device)
     run_device = device
-    moved = False
-    if model_device.type == "meta":
-        model.to(run_device)
-        moved = True
-        logger.info("[QAT W4A4 Calib] Moved model from meta to %s for calibration", run_device)
-    elif model_device != run_device:
-        model.to(run_device)
-        moved = True
-        logger.info(
-            "[QAT W4A4 Calib] Moved model from %s to %s for calibration",
-            model_device,
-            run_device,
-        )
 
-    restore_device = model_device if model_device.type != "meta" else torch.device("cpu")
     model.train()
     ran = 0
     try:
@@ -189,9 +237,7 @@ def _run_forward_batches(
                 ran += 1
         model.eval()
     finally:
-        if moved:
-            model.to(restore_device)
-            logger.info("[QAT W4A4 Calib] Restored model to %s after calibration", restore_device)
+        _restore_fsdp_model_device(model, restore_device, moved)
 
     return ran
 
@@ -228,7 +274,6 @@ def _iter_synthetic_batches(
     seed: int,
 ):
     vocab_size = model.config.vocab_size
-    pad_token_id = getattr(model.config, "pad_token_id", None) or 0
     generator = torch.Generator()
     generator.manual_seed(seed)
 
@@ -253,18 +298,25 @@ def run_w4a4_activation_calibration(
     seed: int = 42,
     device: Optional[torch.device] = None,
 ) -> int:
-    """Populate input_global_scale/input_amax via observer-forward passes."""
+    """Populate input_global_scale/input_amax via observer-forward passes on FSDP GPU model."""
     device = _normalize_device(device)
 
     total_before, uninit_before = count_uninitialized_w4a4_modules(model)
-    if uninit_before == 0:
-        logger.info("[QAT W4A4 Calib] All %d W4A4 layers already initialized, skipping", total_before)
+    moe_total, moe_uninit = count_uninitialized_moe_layers(model)
+    if uninit_before == 0 and moe_uninit == 0:
+        logger.info(
+            "[QAT W4A4 Calib] All %d W4A4 linear and %d MoE layers already initialized, skipping",
+            total_before,
+            moe_total,
+        )
         return 0
 
     logger.info(
-        "[QAT W4A4 Calib] %d/%d W4A4 layers need activation calibration",
+        "[QAT W4A4 Calib] %d/%d W4A4 linear + %d/%d MoE layers need activation calibration (post-FSDP GPU forward)",
         uninit_before,
         total_before,
+        moe_uninit,
+        moe_total,
     )
 
     max_batches = max(1, (num_samples + batch_size - 1) // batch_size)
@@ -280,7 +332,11 @@ def run_w4a4_activation_calibration(
         source = f"parquet ({data_files})"
     else:
         if data_files and tokenizer is None:
-            logger.warning("[QAT W4A4 Calib] calib_data_files set but tokenizer missing, using synthetic data")
+            raise RuntimeError(
+                "[QAT W4A4 Calib] calib_data_files is set but tokenizer is missing; "
+                "cannot run activation forward calibration."
+            )
+        logger.warning("[QAT W4A4 Calib] No calib_data_files; using synthetic random tokens")
         batches = _iter_synthetic_batches(
             model,
             num_samples=num_samples,
@@ -291,17 +347,31 @@ def run_w4a4_activation_calibration(
         source = "synthetic random tokens"
 
     ran_batches = _run_forward_batches(model, batches, device=device, max_batches=max_batches)
+
+    from verl.utils.qat.moe import fallback_moe_scales_from_weights
+
+    fallback_moe_scales_from_weights(model)
+
     _, uninit_after = count_uninitialized_w4a4_modules(model)
-    calibrated = uninit_before - uninit_after
+    _, moe_uninit_after = count_uninitialized_moe_layers(model)
+    calibrated = (uninit_before - uninit_after) + (moe_uninit - moe_uninit_after)
 
     logger.info(
-        "[QAT W4A4 Calib] Finished %d batches from %s; initialized %d layers (%d still uninitialized)",
+        "[QAT W4A4 Calib] Finished %d batches from %s; initialized %d scale groups "
+        "(%d linear + %d MoE still uninitialized)",
         ran_batches,
         source,
         calibrated,
         uninit_after,
+        moe_uninit_after,
     )
     get_torch_device().empty_cache()
+
+    if uninit_after > 0 or moe_uninit_after > 0:
+        raise RuntimeError(
+            f"[QAT W4A4 Calib] {uninit_after} linear and {moe_uninit_after} MoE layers still have "
+            "uninitialized input_global_scale/input_amax after post-FSDP activation forward calibration."
+        )
     return calibrated
 
 
@@ -311,13 +381,19 @@ def maybe_calibrate_w4a4_activations(
     *,
     tokenizer=None,
     device: Optional[torch.device] = None,
+    post_fsdp: bool = False,
 ) -> int:
-    """Run calibration when W4A4 scales are missing and calib_enable is True."""
+    """Run post-FSDP GPU activation forward calibration when W4A4 scales are missing."""
     if not getattr(qat_config, "enable", False):
         return 0
     if getattr(qat_config, "mode", "").lower() != "w4a4":
         return 0
     if not getattr(qat_config, "calib_enable", True):
+        return 0
+    if not post_fsdp:
+        logger.info(
+            "[QAT W4A4 Calib] Skipping pre-FSDP path; activation calibration runs after FSDP wrap on GPU"
+        )
         return 0
     if not needs_w4a4_calibration(model):
         return 0
@@ -341,10 +417,12 @@ def maybe_calibrate_w4a4_activations(
 
 __all__ = [
     "UNINITIALIZED_SCALE",
+    "count_uninitialized_moe_layers",
     "count_uninitialized_w4a4_modules",
     "input_global_scale_from_amax",
     "is_scale_uninitialized",
     "maybe_calibrate_w4a4_activations",
+    "needs_moe_calibration",
     "needs_w4a4_calibration",
     "run_w4a4_activation_calibration",
 ]

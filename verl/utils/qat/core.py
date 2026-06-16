@@ -16,6 +16,7 @@
 
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -25,6 +26,7 @@ import torch.nn as nn
 from verl.base_config import BaseConfig
 
 logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
 @dataclass
@@ -132,6 +134,13 @@ def apply_qat(
         converted_count += 1
 
     logger.info(f"Successfully applied QAT to {converted_count} layers")
+
+    if mode == QATMode.W4A4:
+        from verl.utils.qat.moe import _apply_qat_moe_layers
+
+        moe_count = _apply_qat_moe_layers(model, config)
+        if moe_count:
+            logger.info(f"Applied QAT to {moe_count} fused MoE expert modules")
 
     return model
 
