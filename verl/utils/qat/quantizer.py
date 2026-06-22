@@ -37,6 +37,7 @@ from compressed_tensors.quantization.utils.helpers import generate_gparam
 from verl.utils.device import get_device_name, get_torch_device
 from verl.utils.qat.calibration import input_global_scale_from_amax, is_scale_uninitialized
 from verl.utils.qat.compressed_tensors_compat import create_nvfp4_weight_packer
+from verl.utils.qat.core import MARLIN_TILE_N
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -196,6 +197,8 @@ class QATQuantizer:
         if tensor.dim() != 2:
             return False
         if tensor.shape[1] % self.group_size != 0:
+            return False
+        if self.mode == "w4a16" and tensor.shape[0] % MARLIN_TILE_N != 0:
             return False
 
         return not self._matches_ignore_pattern(self._module_name(name))

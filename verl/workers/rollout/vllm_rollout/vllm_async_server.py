@@ -137,8 +137,17 @@ class vLLMHttpServer:
         self.global_steps = None
 
         if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":
-            logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
-            self.config.load_format = "auto"
+            from verl.utils.qat.core import is_qat_config_enabled
+
+            qat_enabled = is_qat_config_enabled(getattr(self.config, "qat", None))
+            if qat_enabled:
+                logger.info(
+                    "QAT enabled in standalone rollout mode: keeping load_format=dummy "
+                    "(weights will be synced from trainer via checkpoint_engine)"
+                )
+            else:
+                logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
+                self.config.load_format = "auto"
 
         # used for http server
         self._server_address = ray.util.get_node_ip_address().strip("[]")

@@ -463,26 +463,26 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         return batch
 
     def _compute_old_log_prob(self, batch: DataProto):
-        """
-        If algorithm.rollout_correction.bypass_mode is False,
-        use model engine and first version model params to re-calculate old_log_prob.
+        """Compute old_log_probs using the **current** trainer model (no CPU swap).
 
-        If local_trigger_step == 1, load the training engine's parameters to the CPU
-          and save a copy for subsequent MIS use.
+        In the fully-async setting the rollout trajectories may come from a stale
+        model version (bounded by ``staleness_threshold``).  The Decoupled
+        importance-sampling ratio ``pi_current_trainer / pi_rollout`` naturally
+        absorbs both the quantisation mismatch (BF16+fake-quant vs. w4a16 vLLM)
+        **and** the staleness drift, so there is no need to roll the trainer
+        back to the version that produced the rollout.
 
-        If local_trigger_step == 2, 3, ..., restore the parameters of version 1 to calculate the old_log_prob,
-        then restore the parameters of the current version.
+        Previous implementation saved the version-1 model to CPU and restored
+        it on every intermediate step (``local_trigger_step`` 2 … N), causing a
+        full-model CPU<->GPU swap per step.  With QAT + param/optimizer
+        offload this was the dominant source of peak VRAM and wall-clock
+        overhead, routinely OOMing on 4-GPU async setups.
+
+        Skipping the swap is both cheaper *and* semantically cleaner:
+        ``old_log_probs`` represents the policy we are taking the gradient
+        **from** (the current model), not the policy that generated the data.
         """
-        if self.local_trigger_step == 1:
-            self.actor_rollout_wg.save_model_to_cpu(1)
-            old_log_prob, old_log_prob_mfu = super()._compute_old_log_prob(batch)
-        else:
-            self.actor_rollout_wg.save_model_to_cpu(self.local_trigger_step)
-            self.actor_rollout_wg.restore_model_from_cpu(1)
-            old_log_prob, old_log_prob_mfu = super()._compute_old_log_prob(batch)
-            self.actor_rollout_wg.restore_model_from_cpu(self.local_trigger_step)
-            self.actor_rollout_wg.clear_cpu_model(self.local_trigger_step)
-        return old_log_prob, old_log_prob_mfu
+        return super()._compute_old_log_prob(batch)
 
     def _fit_update_local_step(self):
         time_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]

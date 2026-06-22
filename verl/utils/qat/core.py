@@ -26,6 +26,20 @@ from verl.base_config import BaseConfig
 
 logger = logging.getLogger(__name__)
 
+# vLLM NVFP4 Marlin W4A16 requires output dim divisible by this tile size.
+MARLIN_TILE_N = 64
+
+
+def _ignore_patterns_for_vllm(patterns: list[str]) -> list[str]:
+    """Return ignore patterns for vLLM compressed-tensors config.
+
+    vLLM uses the same ``re:``-prefixed regex convention as verl FSDP QAT
+    (see ``check_equal_or_regex_match`` in vLLM compressed_tensors utils).
+    Patterns must be passed through unchanged; stripping ``re:`` breaks
+    regex ignores such as ``re:.*in_proj_ba$`` for Qwen3.5 GDN layers.
+    """
+    return list(patterns)
+
 
 @dataclass
 class QATConfig(BaseConfig):
@@ -47,6 +61,17 @@ class QATConfig(BaseConfig):
     calib_seed: int = 42
 
 
+def is_qat_config_enabled(qat_config: "QATConfig | dict[str, Any] | None") -> bool:
+    """Return True when QAT is enabled in a rollout/actor config fragment."""
+    if qat_config is None:
+        return False
+    if isinstance(qat_config, QATConfig):
+        return qat_config.enable
+    if isinstance(qat_config, dict):
+        return bool(qat_config.get("enable", False))
+    return bool(getattr(qat_config, "enable", False))
+
+
 def load_quantization_config(qat_config: QATConfig) -> dict[str, Any]:
     """Load quantization config JSON file from QATConfig."""
     if not qat_config.quantization_config_path:
@@ -59,9 +84,10 @@ def load_quantization_config(qat_config: QATConfig) -> dict[str, Any]:
 
     if qat_config.ignore_patterns:
         original_ignore = quant_config.get("ignore", [])
-        quant_config["ignore"] = qat_config.ignore_patterns
-        if original_ignore != qat_config.ignore_patterns:
-            logger.info(f"Overriding JSON 'ignore' field: {original_ignore} -> {qat_config.ignore_patterns}")
+        vllm_ignore = _ignore_patterns_for_vllm(qat_config.ignore_patterns)
+        quant_config["ignore"] = vllm_ignore
+        if original_ignore != vllm_ignore:
+            logger.info(f"Overriding JSON 'ignore' field: {original_ignore} -> {vllm_ignore}")
 
     logger.info("Successfully loaded QAT quantization config")
     return quant_config
@@ -86,6 +112,13 @@ def _should_quantize(name: str, module: nn.Module, config: QATConfig) -> bool:
     if module.in_features % config.group_size != 0:
         logger.warning(
             f"Skipping {name}: in_features={module.in_features} not divisible by group_size={config.group_size}"
+        )
+        return False
+
+    if config.mode.lower() == "w4a16" and module.out_features % MARLIN_TILE_N != 0:
+        logger.warning(
+            f"Skipping {name}: out_features={module.out_features} not divisible by "
+            f"marlin_tile_n={MARLIN_TILE_N}"
         )
         return False
 
